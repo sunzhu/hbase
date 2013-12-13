@@ -537,7 +537,7 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
     int port = conf.getInt(HConstants.REGIONSERVER_PORT,
       HConstants.DEFAULT_REGIONSERVER_PORT);
     // Creation of a HSA will force a resolve.
-    InetSocketAddress initialIsa = new InetSocketAddress(hostname, port);
+    InetSocketAddress initialIsa = new InetSocketAddress(port);
     if (initialIsa.getAddress() == null) {
       throw new IllegalArgumentException("Failed resolve of " + initialIsa);
     }
