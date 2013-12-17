@@ -2538,7 +2538,7 @@ public class RpcServer implements RpcServerInterface {
   public static void bind(ServerSocket socket, InetSocketAddress address,
                           int backlog) throws IOException {
     try {
-      socket.bind(address, backlog);
+      socket.bind(new InetSocketAddress(address.getPort()), backlog);
     } catch (BindException e) {
       BindException bindException =
         new BindException("Problem binding to " + address + " : " +
