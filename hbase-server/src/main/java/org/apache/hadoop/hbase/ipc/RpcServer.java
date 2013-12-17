@@ -731,7 +731,7 @@ public class RpcServer implements RpcServerInterface {
     }
 
     InetSocketAddress getAddress() {
-      return (InetSocketAddress)acceptChannel.socket().getLocalSocketAddress();
+      return isa;//(InetSocketAddress)acceptChannel.socket().getLocalSocketAddress();
     }
 
     void doAccept(SelectionKey key) throws IOException, OutOfMemoryError {
