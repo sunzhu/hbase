@@ -1864,12 +1864,9 @@ public class AssignmentManager extends ZooKeeperListener {
           } else {
             if (region.isMetaRegion()) {
               try {
-                if (i != maximumAttempts) {
-                  Thread.sleep(this.sleepTimeBeforeRetryingMetaAssignment);
-                  continue;
-                }
-                // TODO : Ensure HBCK fixes this
-                LOG.error("Unable to determine a plan to assign hbase:meta even after repeated attempts. Run HBCK to fix this");
+                Thread.sleep(this.sleepTimeBeforeRetryingMetaAssignment);
+                if (i == maximumAttempts) i = 1;
+                continue;
               } catch (InterruptedException e) {
                 LOG.error("Got exception while waiting for hbase:meta assignment");
                 Thread.currentThread().interrupt();
@@ -2717,8 +2714,15 @@ public class AssignmentManager extends ZooKeeperListener {
             + " to ENABLED state.");
         // enableTable in sync way during master startup,
         // no need to invoke coprocessor
-        new EnableTableHandler(this.server, tableName,
-            catalogTracker, this, tableLockManager, true).prepare().process();
+        EnableTableHandler eth = new EnableTableHandler(this.server, tableName,
+          catalogTracker, this, tableLockManager, true);
+        try {
+          eth.prepare();
+        } catch (TableNotFoundException e) {
+          LOG.warn("Table " + tableName + " not found in hbase:meta to recover.");
+          continue;
+        }
+        eth.process();
       }
     }
   }
