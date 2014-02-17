@@ -633,17 +633,19 @@ public class AssignmentManager extends ZooKeeperListener {
       }
       // Put it back in transition so that SSH can re-assign it
       regionStates.updateRegionState(regionInfo, State.OFFLINE, sn);
-      // No mater the previous server is online or offline,
-      // we need to reset the last region server of the region.
-      regionStates.setLastRegionServerOfRegion(sn, encodedName);
+
       if (regionInfo.isMetaRegion()) {
         // If it's meta region, reset the meta location.
         // So that master knows the right meta region server.
         MetaRegionTracker.setMetaLocation(watcher, sn);
-      }
-      // Make sure we know the server is dead.
-      if (!serverManager.isServerDead(sn)) {
-        serverManager.expireServer(sn);
+      } else {
+        // No matter the previous server is online or offline,
+        // we need to reset the last region server of the region.
+        regionStates.setLastRegionServerOfRegion(sn, encodedName);
+        // Make sure we know the server is dead.
+        if (!serverManager.isServerDead(sn)) {
+          serverManager.expireServer(sn);
+        }
       }
       return false;
     }
@@ -3142,9 +3144,6 @@ public class AssignmentManager extends ZooKeeperListener {
    * @param plan Plan to execute.
    */
   public void balance(final RegionPlan plan) {
-    synchronized (this.regionPlans) {
-      this.regionPlans.put(plan.getRegionName(), plan);
-    }
     HRegionInfo hri = plan.getRegionInfo();
     TableName tableName = hri.getTable();
     if (zkTable.isDisablingOrDisabledTable(tableName)) {
@@ -3152,7 +3151,24 @@ public class AssignmentManager extends ZooKeeperListener {
         + tableName);
       return;
     }
-    unassign(hri, false, plan.getDestination());
+
+    // Move the region only if it's assigned
+    String encodedName = hri.getEncodedName();
+    ReentrantLock lock = locker.acquireLock(encodedName);
+    try {
+      if (!regionStates.isRegionOnline(hri)) {
+        RegionState state = regionStates.getRegionState(encodedName);
+        LOG.info("Ignored moving region not assigned: " + hri + ", "
+          + (state == null ? "not in region states" : state));
+        return;
+      }
+      synchronized (this.regionPlans) {
+        this.regionPlans.put(plan.getRegionName(), plan);
+      }
+      unassign(hri, false, plan.getDestination());
+    } finally {
+      lock.unlock();
+    }
   }
 
   public void stop() {

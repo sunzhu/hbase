@@ -112,6 +112,7 @@ import org.apache.hadoop.hbase.protobuf.generated.ClientProtos;
 import org.apache.hadoop.hbase.protobuf.generated.ClusterStatusProtos;
 import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos;
 import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.NameStringPair;
+import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionServerInfo;
 import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifier.RegionSpecifierType;
 import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.SnapshotDescription;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos;
@@ -1006,16 +1007,23 @@ MasterServices, Server {
       assigned++;
       if (!rit) {
         // Assign meta since not already in transition
-        if (!serverManager.isServerDead(currentMetaServer)) {
-          LOG.info("Forcing expire of " + currentMetaServer);
-          serverManager.expireServer(currentMetaServer);
+        if (currentMetaServer != null) {
+          // If the meta server is not known to be dead or online,
+          // just split the meta log, and don't expire it since this
+          // could be a full cluster restart. Otherwise, we will think
+          // this is a failover and lose previous region locations.
+          // If it is really a failover case, AM will find out in rebuilding
+          // user regions. Otherwise, we are good since all logs are split
+          // or known to be replayed before user regions are assigned.
+          if (serverManager.isServerOnline(currentMetaServer)) {
+            LOG.info("Forcing expire of " + currentMetaServer);
+            serverManager.expireServer(currentMetaServer);
+          }
           splitMetaLogBeforeAssignment(currentMetaServer);
           if (this.distributedLogReplay) {
             logReplayFailedMetaServer = currentMetaServer;
           }
         }
-        // Make sure assignment manager knows where the meta is,
-        // so that meta sever shutdown handler kicks in.
         assignmentManager.assignMeta();
       }
     } else {
@@ -2159,6 +2167,15 @@ MasterServices, Server {
     return masterActiveTime;
   }
 
+  public int getRegionServerInfoPort(final ServerName sn) {
+    RegionServerInfo info = this.regionServerTracker.getRegionServerInfo(sn);
+    if (info == null || info.getInfoPort() == 0) {
+      return conf.getInt(HConstants.REGIONSERVER_INFO_PORT,
+        HConstants.DEFAULT_REGIONSERVER_INFOPORT);
+    }
+    return info.getInfoPort();
+  }
+  
   /**
    * @return array of coprocessor SimpleNames.
    */

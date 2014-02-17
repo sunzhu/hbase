@@ -23,7 +23,7 @@
   <parent>
     <artifactId>hbase</artifactId>
     <groupId>org.apache.hbase</groupId>
-    <version>0.96.2-SNAPSHOT</version>
+    <version>0.96.2</version>
     <relativePath>..</relativePath>
   </parent>
   <artifactId>hbase-server</artifactId>
@@ -437,10 +437,6 @@
     <dependency>
       <groupId>javax.xml.bind</groupId>
       <artifactId>jaxb-api</artifactId>
-    </dependency>
-    <dependency>
-      <groupId>stax</groupId>
-      <artifactId>stax-api</artifactId>
     </dependency>
     <!-- tracing Dependencies -->
     <dependency>

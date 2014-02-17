@@ -49,6 +49,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import javax.management.ObjectName;
 
+import com.google.protobuf.HBaseZeroCopyByteString;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.classification.InterfaceAudience;
@@ -172,6 +173,7 @@ import org.apache.hadoop.hbase.protobuf.generated.ClusterStatusProtos;
 import org.apache.hadoop.hbase.protobuf.generated.ClusterStatusProtos.RegionLoad;
 import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.Coprocessor;
 import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.NameStringPair;
+import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionServerInfo;
 import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifier;
 import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.RegionSpecifier.RegionSpecifierType;
 import org.apache.hadoop.hbase.protobuf.generated.RegionServerStatusProtos.GetLastFlushedSequenceIdRequest;
@@ -232,7 +234,6 @@ import com.google.protobuf.Message;
 import com.google.protobuf.RpcController;
 import com.google.protobuf.ServiceException;
 import com.google.protobuf.TextFormat;
-import com.google.protobuf.ZeroCopyLiteralByteString;
 
 /**
  * HRegionServer makes a set of HRegions available to clients. It checks in with
@@ -336,8 +337,8 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
   // debugging and unit tests.
   protected volatile boolean abortRequested;
 
-  // Port we put up the webui on.
-  protected int webuiport = -1;
+  // region server static info like info port
+  private RegionServerInfo.Builder rsInfo;
 
   ConcurrentMap<String, Integer> rowlocks = new ConcurrentHashMap<String, Integer>();
 
@@ -574,10 +575,14 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
         abort("Uncaught exception in service thread " + t.getName(), e);
       }
     };
-    this.rsHost = new RegionServerCoprocessorHost(this, this.conf);
 
     this.distributedLogReplay = this.conf.getBoolean(HConstants.DISTRIBUTED_LOG_REPLAY_KEY,
       HConstants.DEFAULT_DISTRIBUTED_LOG_REPLAY_CONFIG);
+    
+    this.rsInfo = RegionServerInfo.newBuilder();
+    // Put up the webui. Webui may come up on port other than configured if
+    // that port is occupied. Adjust serverInfo if this is the case.
+    this.rsInfo.setInfoPort(putUpWebUI());
   }
 
   /**
@@ -791,6 +796,11 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
         }
       }
 
+      // Initialize the RegionServerCoprocessorHost now that our ephemeral
+      // node was created by reportForDuty, in case any coprocessors want
+      // to use ZooKeeper
+      this.rsHost = new RegionServerCoprocessorHost(this, this.conf);
+
       if (!this.stopped && isHealthy()){
         // start the snapshot handler, since the server is ready to run
         this.snapshotManager.start();
@@ -811,13 +821,14 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
           } else if (this.stopping) {
             boolean allUserRegionsOffline = areAllUserRegionsOffline();
             if (allUserRegionsOffline) {
-              // Set stopped if no requests since last time we went around the loop.
-              // The remaining meta regions will be closed on our way out.
-              if (oldRequestCount == this.requestCount.get()) {
+              // Set stopped if no more write requests tp meta tables
+              // since last time we went around the loop.  Any open
+              // meta regions will be closed on our way out.
+              if (oldRequestCount == getWriteRequestCount()) {
                 stop("Stopped; only catalog regions remaining online");
                 break;
               }
-              oldRequestCount = this.requestCount.get();
+              oldRequestCount = getWriteRequestCount();
             } else {
               // Make sure all regions have been closed -- some regions may
               // have not got it because we were splitting at the time of
@@ -965,6 +976,17 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
       }
     }
     return allUserRegionsOffline;
+  }
+
+  /**
+   * @return Current write count for all online regions.
+   */
+  private long getWriteRequestCount() {
+    int writeCount = 0;
+    for (Map.Entry<String, HRegion> e: this.onlineRegions.entrySet()) {
+      writeCount += e.getValue().getWriteRequestsCount();
+    }
+    return writeCount;
   }
 
   void tryRegionServerReport(long reportStartTime, long reportEndTime)
@@ -1198,9 +1220,10 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
     }
   }
 
-  private void createMyEphemeralNode() throws KeeperException {
-    ZKUtil.createEphemeralNodeAndWatch(this.zooKeeper, getMyEphemeralNodePath(),
-      HConstants.EMPTY_BYTE_ARRAY);
+  private void createMyEphemeralNode() throws KeeperException, IOException {
+    byte[] data = ProtobufUtil.prependPBMagic(rsInfo.build().toByteArray());
+    ZKUtil.createEphemeralNodeAndWatch(this.zooKeeper,
+      getMyEphemeralNodePath(), data);
   }
 
   private void deleteMyEphemeralNode() throws KeeperException {
@@ -1264,7 +1287,7 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
     RegionLoad.Builder regionLoad = RegionLoad.newBuilder();
     RegionSpecifier.Builder regionSpecifier = RegionSpecifier.newBuilder();
     regionSpecifier.setType(RegionSpecifierType.REGION_NAME);
-    regionSpecifier.setValue(ZeroCopyLiteralByteString.wrap(name));
+    regionSpecifier.setValue(HBaseZeroCopyByteString.wrap(name));
     regionLoad.setRegionSpecifier(regionSpecifier.build())
       .setStores(stores)
       .setStorefiles(storefiles)
@@ -1536,10 +1559,6 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
     this.leases.setName(n + ".leaseChecker");
     this.leases.start();
 
-    // Put up the webui.  Webui may come up on port other than configured if
-    // that port is occupied. Adjust serverInfo if this is the case.
-    this.webuiport = putUpWebUI();
-
     if (this.replicationSourceHandler == this.replicationSinkHandler &&
         this.replicationSourceHandler != null) {
       this.replicationSourceHandler.startReplicationService();
@@ -1603,7 +1622,7 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
         port++;
       }
     }
-    return port;
+    return this.infoServer.getPort();
   }
 
   /*
@@ -1658,7 +1677,9 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
   @Override
   public void stop(final String msg) {
     try {
-      this.rsHost.preStop(msg);
+    	if (this.rsHost != null) {
+    		this.rsHost.preStop(msg);
+    	}
       this.stopped = true;
       LOG.info("STOPPED: " + msg);
       // Wakes run() if it is sleeping
@@ -3898,7 +3919,7 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
       RollWALWriterResponse.Builder builder = RollWALWriterResponse.newBuilder();
       if (regionsToFlush != null) {
         for (byte[] region: regionsToFlush) {
-          builder.addRegionToFlush(ZeroCopyLiteralByteString.wrap(region));
+          builder.addRegionToFlush(HBaseZeroCopyByteString.wrap(region));
         }
       }
       return builder.build();
@@ -3935,7 +3956,7 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
       final GetServerInfoRequest request) throws ServiceException {
     ServerName serverName = getServerName();
     requestCount.increment();
-    return ResponseConverter.buildGetServerInfoResponse(serverName, webuiport);
+    return ResponseConverter.buildGetServerInfoResponse(serverName, rsInfo.getInfoPort());
   }
 
 // End Admin methods

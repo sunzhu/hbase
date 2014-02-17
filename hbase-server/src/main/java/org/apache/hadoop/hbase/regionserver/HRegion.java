@@ -1284,6 +1284,14 @@ public class HRegion implements HeapSize { // , Writable{
     // block waiting for the lock for compaction
     lock.readLock().lock();
     try {
+      byte[] cf = Bytes.toBytes(store.getColumnFamilyName());
+      if (stores.get(cf) != store) {
+        LOG.warn("Store " + store.getColumnFamilyName() + " on region " + this
+            + " has been re-instantiated, cancel this compaction request. "
+            + " It may be caused by the roll back of split transaction");
+        return false;
+      }
+
       status = TaskMonitor.get().createStatus("Compacting " + store + " in " + this);
       if (this.closed.get()) {
         String msg = "Skipping compaction on " + this + " because closed";
@@ -2001,7 +2009,12 @@ public class HRegion implements HeapSize { // , Writable{
             batchOp.retCodeDetails[i] = OperationStatus.SUCCESS;
           }
         } else if (m instanceof Delete) {
-          if (coprocessorHost.preDelete((Delete) m, walEdit, m.getDurability())) {
+          Delete curDel = (Delete) m;
+          if (curDel.getFamilyCellMap().isEmpty()) {
+            // handle deleting a row case
+            prepareDelete(curDel);
+          }
+          if (coprocessorHost.preDelete(curDel, walEdit, m.getDurability())) {
             // pre hook says skip this Delete
             // mark as success and skip in doMiniBatchMutation
             batchOp.retCodeDetails[i] = OperationStatus.SUCCESS;
@@ -3688,10 +3701,12 @@ public class HRegion implements HeapSize { // , Writable{
           if (filter != null && filter.hasFilterRow()) {
             filter.filterRowCells(results);
           }
-          if (isEmptyRow) {
+          
+          if (isEmptyRow || filterRow()) {
+            results.clear();
             boolean moreRows = nextRow(currentRow, offset, length);
             if (!moreRows) return false;
-            results.clear();
+
             // This row was totally filtered out, if this is NOT the last row,
             // we should continue on. Otherwise, nothing else to do.
             if (!stopRow) continue;
@@ -3741,6 +3756,20 @@ public class HRegion implements HeapSize { // , Writable{
       }
     }
 
+    /**
+     * This function is to maintain backward compatibility for 0.94 filters. HBASE-6429 combines
+     * both filterRow & filterRow(List<KeyValue> kvs) functions. While 0.94 code or older, it may
+     * not implement hasFilterRow as HBase-6429 expects because 0.94 hasFilterRow() only returns
+     * true when filterRow(List<KeyValue> kvs) is overridden not the filterRow(). Therefore, the
+     * filterRow() will be skipped.
+     */
+    private boolean filterRow() throws IOException {
+      // when hasFilterRow returns true, filter.filterRow() will be called automatically inside
+      // filterRowCells(List<Cell> kvs) so we skip that scenario here.
+      return filter != null && (!filter.hasFilterRow())
+          && filter.filterRow();
+    }
+    
     private boolean filterRowKey(byte[] row, int offset, short length) throws IOException {
       return filter != null
           && filter.filterRowKey(row, offset, length);
@@ -4156,11 +4185,14 @@ public class HRegion implements HeapSize { // , Writable{
    * @throws IOException
    */
   HRegion createDaughterRegionFromSplits(final HRegionInfo hri) throws IOException {
+    // Move the files from the temporary .splits to the final /table/region directory
+    fs.commitDaughterRegion(hri);
+
+    // Create the daughter HRegion instance
     HRegion r = HRegion.newHRegion(this.fs.getTableDir(), this.getLog(), fs.getFileSystem(),
         this.getBaseConf(), hri, this.getTableDesc(), rsServices);
     r.readRequestsCount.set(this.getReadRequestsCount() / 2);
     r.writeRequestsCount.set(this.getWriteRequestsCount() / 2);
-    fs.commitDaughterRegion(hri);
     return r;
   }
 
@@ -4697,7 +4729,11 @@ public class HRegion implements HeapSize { // , Writable{
 
             Store store = stores.get(family.getKey());
             List<Cell> kvs = new ArrayList<Cell>(family.getValue().size());
-  
+
+            // Sort the cells so that they match the order that they
+            // appear in the Get results. Otherwise, we won't be able to
+            // find the existing values if the cells are not specified
+            // in order by the client since cells are in an array list.
             Collections.sort(family.getValue(), store.getComparator());
             // Get previous values for all columns in this family
             Get get = new Get(row);
@@ -4873,6 +4909,11 @@ public class HRegion implements HeapSize { // , Writable{
             Store store = stores.get(family.getKey());
             List<Cell> kvs = new ArrayList<Cell>(family.getValue().size());
 
+            // Sort the cells so that they match the order that they
+            // appear in the Get results. Otherwise, we won't be able to
+            // find the existing values if the cells are not specified
+            // in order by the client since cells are in an array list.
+            Collections.sort(family.getValue(), store.getComparator());
             // Get previous values for all columns in this family
             Get get = new Get(row);
             for (Cell cell: family.getValue()) {

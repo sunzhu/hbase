@@ -20,11 +20,12 @@
 package org.apache.hadoop.hbase.filter;
 
 import com.google.common.base.Preconditions;
+import com.google.protobuf.HBaseZeroCopyByteString;
 import com.google.protobuf.InvalidProtocolBufferException;
-import com.google.protobuf.ZeroCopyLiteralByteString;
 
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.classification.InterfaceStability;
+import org.apache.hadoop.hbase.Cell;
 import org.apache.hadoop.hbase.exceptions.DeserializationException;
 import org.apache.hadoop.hbase.protobuf.generated.FilterProtos;
 import org.apache.hadoop.hbase.util.Bytes;
@@ -66,6 +67,12 @@ public class PrefixFilter extends FilterBase {
     return filterRow;
   }
 
+  @Override
+  public ReturnCode filterKeyValue(Cell v) {
+    if (filterRow) return ReturnCode.NEXT_ROW;
+    return ReturnCode.INCLUDE;
+  }
+
   public boolean filterRow() {
     return filterRow;
   }
@@ -91,7 +98,7 @@ public class PrefixFilter extends FilterBase {
   public byte [] toByteArray() {
     FilterProtos.PrefixFilter.Builder builder =
       FilterProtos.PrefixFilter.newBuilder();
-    if (this.prefix != null) builder.setPrefix(ZeroCopyLiteralByteString.wrap(this.prefix));
+    if (this.prefix != null) builder.setPrefix(HBaseZeroCopyByteString.wrap(this.prefix));
     return builder.build().toByteArray();
   }
 

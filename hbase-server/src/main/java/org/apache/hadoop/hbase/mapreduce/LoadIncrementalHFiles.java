@@ -25,6 +25,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Deque;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedList;
 import java.util.List;
@@ -41,6 +42,7 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
+import org.apache.commons.lang.mutable.MutableInt;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.classification.InterfaceAudience;
@@ -98,10 +100,13 @@ public class LoadIncrementalHFiles extends Configured implements Tool {
   private static final Log LOG = LogFactory.getLog(LoadIncrementalHFiles.class);
   static final AtomicLong regionCount = new AtomicLong(0);
   private HBaseAdmin hbAdmin;
-  private Configuration cfg;
 
   public static final String NAME = "completebulkload";
+  public static final String MAX_FILES_PER_REGION_PER_FAMILY
+    = "hbase.mapreduce.bulkload.max.hfiles.perRegion.perFamily";
   private static final String ASSIGN_SEQ_IDS = "hbase.mapreduce.bulkload.assign.sequenceNumbers";
+
+  private int maxFilesPerRegionPerFamily;
   private boolean assignSeqIds;
 
   private boolean hasForwardedToken;
@@ -111,10 +116,14 @@ public class LoadIncrementalHFiles extends Configured implements Tool {
 
   public LoadIncrementalHFiles(Configuration conf) throws Exception {
     super(conf);
-    this.cfg = conf;
+    // make a copy, just to be sure we're not overriding someone else's config
+    setConf(HBaseConfiguration.create(getConf()));
+    // disable blockcache for tool invocation, see HBASE-10500
+    getConf().setFloat(HConstants.HFILE_BLOCK_CACHE_SIZE_KEY, 0);
     this.hbAdmin = new HBaseAdmin(conf);
     this.userProvider = UserProvider.instantiate(conf);
     assignSeqIds = conf.getBoolean(ASSIGN_SEQ_IDS, true);
+    maxFilesPerRegionPerFamily = conf.getInt(MAX_FILES_PER_REGION_PER_FAMILY, 32);
   }
 
   private void usage() {
@@ -202,8 +211,8 @@ public class LoadIncrementalHFiles extends Configured implements Tool {
     }
 
     // initialize thread pools
-    int nrThreads = cfg.getInt("hbase.loadincremental.threads.max",
-        Runtime.getRuntime().availableProcessors());
+    int nrThreads = getConf().getInt("hbase.loadincremental.threads.max",
+      Runtime.getRuntime().availableProcessors());
     ThreadFactoryBuilder builder = new ThreadFactoryBuilder();
     builder.setNameFormat("LoadIncrementalHFiles-%1$d");
     ExecutorService pool = new ThreadPoolExecutor(nrThreads, nrThreads,
@@ -250,7 +259,7 @@ public class LoadIncrementalHFiles extends Configured implements Tool {
       //If using secure bulk load
       //prepare staging directory and token
       if (userProvider.isHBaseSecurityEnabled()) {
-        FileSystem fs = FileSystem.get(cfg);
+        FileSystem fs = FileSystem.get(getConf());
         //This condition is here for unit testing
         //Since delegation token doesn't work in mini cluster
         if (userProvider.isHadoopSecurityEnabled()) {
@@ -276,7 +285,7 @@ public class LoadIncrementalHFiles extends Configured implements Tool {
               + count + " with " + queue.size() + " files remaining to group or split");
         }
 
-        int maxRetries = cfg.getInt("hbase.bulkload.retries.number", 0);
+        int maxRetries = getConf().getInt("hbase.bulkload.retries.number", 0);
         if (maxRetries != 0 && count >= maxRetries) {
           LOG.error("Retry attempted " + count +  " times without completing, bailing out");
           return;
@@ -286,6 +295,12 @@ public class LoadIncrementalHFiles extends Configured implements Tool {
         // Using ByteBuffer for byte[] equality semantics
         Multimap<ByteBuffer, LoadQueueItem> regionGroups = groupOrSplitPhase(table,
             pool, queue, startEndKeys);
+
+        if (!checkHFilesCountPerRegionPerFamily(regionGroups)) {
+          // Error is logged inside checkHFilesCountPerRegionPerFamily.
+          throw new IOException("Trying to load more than " + maxFilesPerRegionPerFamily
+            + " hfiles to one family of one region");
+        }
 
         bulkLoadPhase(table, conn, pool, queue, regionGroups);
 
@@ -298,7 +313,7 @@ public class LoadIncrementalHFiles extends Configured implements Tool {
       if (userProvider.isHBaseSecurityEnabled()) {
         if (userToken != null && !hasForwardedToken) {
           try {
-            userToken.cancel(cfg);
+            userToken.cancel(getConf());
           } catch (Exception e) {
             LOG.warn("Failed to cancel HDFS delegation token.", e);
           }
@@ -372,6 +387,31 @@ public class LoadIncrementalHFiles extends Configured implements Tool {
         throw new IllegalStateException(e1);
       }
     }
+  }
+
+  private boolean checkHFilesCountPerRegionPerFamily(
+      final Multimap<ByteBuffer, LoadQueueItem> regionGroups) {
+    for (Entry<ByteBuffer,
+        ? extends Collection<LoadQueueItem>> e: regionGroups.asMap().entrySet()) {
+      final Collection<LoadQueueItem> lqis =  e.getValue();
+      HashMap<byte[], MutableInt> filesMap = new HashMap<byte[], MutableInt>();
+      for (LoadQueueItem lqi: lqis) {
+        MutableInt count = filesMap.get(lqi.family);
+        if (count == null) {
+          count = new MutableInt();
+          filesMap.put(lqi.family, count);
+        }
+        count.increment();
+        if (count.intValue() > maxFilesPerRegionPerFamily) {
+          LOG.error("Trying to load more than " + maxFilesPerRegionPerFamily
+            + " hfiles to family " + Bytes.toStringBinary(lqi.family)
+            + " of region with start key "
+            + Bytes.toStringBinary(e.getKey()));
+          return false;
+        }
+      }
+    }
+    return true;
   }
 
   /**
@@ -577,7 +617,7 @@ public class LoadIncrementalHFiles extends Configured implements Tool {
           //from the staging directory back to original location
           //in user directory
           if(secureClient != null && !success) {
-            FileSystem fs = FileSystem.get(cfg);
+            FileSystem fs = FileSystem.get(getConf());
             for(Pair<byte[], String> el : famPaths) {
               Path hfileStagingPath = null;
               Path hfileOrigPath = new Path(el.getSecond());
@@ -808,21 +848,22 @@ public class LoadIncrementalHFiles extends Configured implements Tool {
       return -1;
     }
 
-    String dirPath   = args[0];
+    String dirPath = args[0];
     TableName tableName = TableName.valueOf(args[1]);
 
-    boolean tableExists   = this.doesTableExist(tableName);
+    boolean tableExists = this.doesTableExist(tableName);
     if (!tableExists) this.createTable(tableName,dirPath);
 
     Path hfofDir = new Path(dirPath);
-    HTable table = new HTable(this.cfg, tableName);
+    HTable table = new HTable(getConf(), tableName);
 
     doBulkLoad(hfofDir, table);
     return 0;
   }
 
   public static void main(String[] args) throws Exception {
-    int ret = ToolRunner.run(new LoadIncrementalHFiles(HBaseConfiguration.create()), args);
+    Configuration conf = HBaseConfiguration.create();
+    int ret = ToolRunner.run(new LoadIncrementalHFiles(conf), args);
     System.exit(ret);
   }
 
