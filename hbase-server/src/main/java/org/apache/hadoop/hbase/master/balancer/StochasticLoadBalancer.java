@@ -543,13 +543,14 @@ public class StochasticLoadBalancer extends BaseLoadBalancer {
         return pickOtherRandomServer(cluster, thisServer);
       }
 
-      int idx = 0;
-
-      while (idx < regionLocations.length && regionLocations[idx] == thisServer) {
-        idx++;
+      for (int loc : regionLocations) {
+        if (loc >= 0 && loc != thisServer) { // find the first suitable server
+          return loc;
+        }
       }
 
-      return idx;
+      // no location found
+      return pickOtherRandomServer(cluster, thisServer);
     }
 
     void setServices(MasterServices services) {
@@ -824,6 +825,7 @@ public class StochasticLoadBalancer extends BaseLoadBalancer {
     }
 
 
+    @Override
     double cost(Cluster cluster) {
       if (clusterStatus == null || loads == null) {
         return 0;
@@ -891,6 +893,7 @@ public class StochasticLoadBalancer extends BaseLoadBalancer {
     }
 
 
+    @Override
     protected double getCostFromRl(RegionLoad rl) {
       return rl.getReadRequestsCount();
     }
@@ -911,6 +914,7 @@ public class StochasticLoadBalancer extends BaseLoadBalancer {
       this.setMultiplier(conf.getFloat(WRITE_REQUEST_COST_KEY, DEFAULT_WRITE_REQUEST_COST));
     }
 
+    @Override
     protected double getCostFromRl(RegionLoad rl) {
       return rl.getWriteRequestsCount();
     }

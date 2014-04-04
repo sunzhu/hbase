@@ -47,11 +47,11 @@ import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
 import org.apache.hadoop.hbase.util.HasThread;
 import org.apache.hadoop.hbase.util.Threads;
 import org.apache.hadoop.util.StringUtils;
-import org.cliffc.high_scale_lib.Counter;
 
 import com.google.common.base.Preconditions;
 import org.cloudera.htrace.Trace;
 import org.cloudera.htrace.TraceScope;
+import org.apache.hadoop.hbase.util.Counter;
 
 /**
  * Thread that flushes cache on request
@@ -219,6 +219,11 @@ class MemStoreFlusher implements FlushRequester {
   }
 
   private class FlushHandler extends HasThread {
+
+    private FlushHandler(String name) {
+      super(name);
+    }
+
     @Override
     public void run() {
       while (!server.isStopped()) {
@@ -362,7 +367,7 @@ class MemStoreFlusher implements FlushRequester {
     ThreadFactory flusherThreadFactory = Threads.newDaemonThreadFactory(
         server.getServerName().toShortString() + "-MemStoreFlusher", eh);
     for (int i = 0; i < flushHandlers.length; i++) {
-      flushHandlers[i] = new FlushHandler();
+      flushHandlers[i] = new FlushHandler("MemStoreFlusher." + i);
       flusherThreadFactory.newThread(flushHandlers[i]);
       flushHandlers[i].start();
     }

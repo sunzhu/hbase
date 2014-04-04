@@ -170,7 +170,7 @@ module Hbase
             raise(ArgumentError, "Can't find a namespace: #{namespace_name}") unless namespace_exists?(namespace_name)
             # invoke cp endpoint to perform access controls
             perms = org.apache.hadoop.hbase.protobuf.ProtobufUtil.getUserPermissions(
-              protocol, table_name.to_java_bytes)
+              protocol, namespace_name.to_java_bytes)
           else
              raise(ArgumentError, "Can't find table: #{table_name}") unless exists?(table_name)
              perms = org.apache.hadoop.hbase.protobuf.ProtobufUtil.getUserPermissions(
@@ -187,7 +187,7 @@ module Hbase
       count  = 0
       perms.each do |value|
         user_name = String.from_java_bytes(value.getUser)
-        table = (value.getTable != nil) ? value.getTable.toString() : ''
+        table = (value.getTableName != nil) ? value.getTableName.getNameAsString() : ''
         family = (value.getFamily != nil) ? org.apache.hadoop.hbase.util.Bytes::toStringBinary(value.getFamily) : ''
         qualifier = (value.getQualifier != nil) ? org.apache.hadoop.hbase.util.Bytes::toStringBinary(value.getQualifier) : ''
 

@@ -530,13 +530,13 @@ public class HBaseFsck extends Configured {
       List<HRegionInfo> regions = MetaScanner.listAllRegions(getConf(), false);
       final RegionBoundariesInformation currentRegionBoundariesInformation =
           new RegionBoundariesInformation();
+      Path hbaseRoot = FSUtils.getRootDir(getConf());
       for (HRegionInfo regionInfo : regions) {
+        Path tableDir = FSUtils.getTableDir(hbaseRoot, regionInfo.getTable());
         currentRegionBoundariesInformation.regionName = regionInfo.getRegionName();
         // For each region, get the start and stop key from the META and compare them to the
         // same information from the Stores.
-        Path path = new Path(getConf().get(HConstants.HBASE_DIR) + "/"
-            + Bytes.toString(regionInfo.getTable().getName()) + "/"
-            + regionInfo.getEncodedName() + "/");
+        Path path = new Path(tableDir, regionInfo.getEncodedName());
         FileSystem fs = path.getFileSystem(getConf());
         FileStatus[] files = fs.listStatus(path);
         // For all the column families in this region...
@@ -3789,7 +3789,7 @@ public class HBaseFsck extends Configured {
     out.println("");
     out.println("  Datafile Repair options: (expert features, use with caution!)");
     out.println("   -checkCorruptHFiles     Check all Hfiles by opening them to make sure they are valid");
-    out.println("   -sidelineCorruptHfiles  Quarantine corrupted HFiles.  implies -checkCorruptHfiles");
+    out.println("   -sidelineCorruptHFiles  Quarantine corrupted HFiles.  implies -checkCorruptHFiles");
 
     out.println("");
     out.println("  Metadata Repair shortcuts");

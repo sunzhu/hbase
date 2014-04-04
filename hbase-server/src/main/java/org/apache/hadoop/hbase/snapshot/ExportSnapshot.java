@@ -18,12 +18,15 @@
 
 package org.apache.hadoop.hbase.snapshot;
 
+import java.io.FileNotFoundException;
 import java.io.IOException;
+import java.net.URI;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Random;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
@@ -48,6 +51,8 @@ import org.apache.hadoop.hbase.mapreduce.JobUtil;
 import org.apache.hadoop.hbase.mapreduce.TableMapReduceUtil;
 import org.apache.hadoop.hbase.protobuf.generated.HBaseProtos.SnapshotDescription;
 import org.apache.hadoop.hbase.regionserver.StoreFileInfo;
+import org.apache.hadoop.hbase.security.UserProvider;
+import org.apache.hadoop.hbase.security.token.FsDelegationToken;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
 import org.apache.hadoop.hbase.util.FSUtils;
 import org.apache.hadoop.hbase.util.Pair;
@@ -80,20 +85,29 @@ public final class ExportSnapshot extends Configured implements Tool {
   private static final String CONF_CHECKSUM_VERIFY = "snapshot.export.checksum.verify";
   private static final String CONF_OUTPUT_ROOT = "snapshot.export.output.root";
   private static final String CONF_INPUT_ROOT = "snapshot.export.input.root";
+  private static final String CONF_BUFFER_SIZE = "snapshot.export.buffer.size";
+  private static final String CONF_MAP_GROUP = "snapshot.export.default.map.group";
+
+  static final String CONF_TEST_FAILURE = "test.snapshot.export.failure";
+  static final String CONF_TEST_RETRY = "test.snapshot.export.failure.retry";
 
   private static final String INPUT_FOLDER_PREFIX = "export-files.";
 
   // Export Map-Reduce Counters, to keep track of the progress
-  public enum Counter { MISSING_FILES, COPY_FAILED, BYTES_EXPECTED, BYTES_COPIED };
+  public enum Counter { MISSING_FILES, COPY_FAILED, BYTES_EXPECTED, BYTES_COPIED, FILES_COPIED };
 
   private static class ExportMapper extends Mapper<Text, NullWritable, NullWritable, NullWritable> {
     final static int REPORT_SIZE = 1 * 1024 * 1024;
     final static int BUFFER_SIZE = 64 * 1024;
 
+    private boolean testFailures;
+    private Random random;
+
     private boolean verifyChecksum;
     private String filesGroup;
     private String filesUser;
     private short filesMode;
+    private int bufferSize;
 
     private FileSystem outputFs;
     private Path outputArchive;
@@ -104,7 +118,7 @@ public final class ExportSnapshot extends Configured implements Tool {
     private Path inputRoot;
 
     @Override
-    public void setup(Context context) {
+    public void setup(Context context) throws IOException {
       Configuration conf = context.getConfiguration();
       verifyChecksum = conf.getBoolean(CONF_CHECKSUM_VERIFY, true);
 
@@ -117,17 +131,24 @@ public final class ExportSnapshot extends Configured implements Tool {
       inputArchive = new Path(inputRoot, HConstants.HFILE_ARCHIVE_DIRECTORY);
       outputArchive = new Path(outputRoot, HConstants.HFILE_ARCHIVE_DIRECTORY);
 
+      testFailures = conf.getBoolean(CONF_TEST_FAILURE, false);
+
       try {
         inputFs = FileSystem.get(inputRoot.toUri(), conf);
       } catch (IOException e) {
-        throw new RuntimeException("Could not get the input FileSystem with root=" + inputRoot, e);
+        throw new IOException("Could not get the input FileSystem with root=" + inputRoot, e);
       }
 
       try {
         outputFs = FileSystem.get(outputRoot.toUri(), conf);
       } catch (IOException e) {
-        throw new RuntimeException("Could not get the output FileSystem with root="+ outputRoot, e);
+        throw new IOException("Could not get the output FileSystem with root="+ outputRoot, e);
       }
+
+      // Use the default block size of the outputFs if bigger
+      int defaultBlockSize = Math.max((int) outputFs.getDefaultBlockSize(), BUFFER_SIZE);
+      bufferSize = conf.getInt(CONF_BUFFER_SIZE, defaultBlockSize);
+      LOG.info("Using bufferSize=" + StringUtils.humanReadableInt(bufferSize));
     }
 
     @Override
@@ -137,9 +158,7 @@ public final class ExportSnapshot extends Configured implements Tool {
       Path outputPath = getOutputPath(inputPath);
 
       LOG.info("copy file input=" + inputPath + " output=" + outputPath);
-      if (copyFile(context, inputPath, outputPath)) {
-        LOG.info("copy completed for input=" + inputPath + " output=" + outputPath);
-      }
+      copyFile(context, inputPath, outputPath);
     }
 
     /**
@@ -166,49 +185,76 @@ public final class ExportSnapshot extends Configured implements Tool {
       return new Path(outputArchive, path);
     }
 
-    private boolean copyFile(final Context context, final Path inputPath, final Path outputPath)
+    /*
+     * Used by TestExportSnapshot to simulate a failure
+     */
+    private void injectTestFailure(final Context context, final Path inputPath)
         throws IOException {
-      FSDataInputStream in = openSourceFile(inputPath);
-      if (in == null) {
-        context.getCounter(Counter.MISSING_FILES).increment(1);
-        return false;
+      if (testFailures) {
+        if (context.getConfiguration().getBoolean(CONF_TEST_RETRY, false)) {
+          if (random == null) {
+            random = new Random();
+          }
+
+          // FLAKY-TEST-WARN: lower is better, we can get some runs without the
+          // retry, but at least we reduce the number of test failures due to
+          // this test exception from the same map task.
+          if (random.nextFloat() < 0.03) {
+            throw new IOException("TEST RETRY FAILURE: Unable to copy input=" + inputPath
+                                  + " time=" + System.currentTimeMillis());
+          }
+        } else {
+          context.getCounter(Counter.COPY_FAILED).increment(1);
+          throw new IOException("TEST FAILURE: Unable to copy input=" + inputPath);
+        }
+      }
+    }
+
+    private void copyFile(final Context context, final Path inputPath, final Path outputPath)
+        throws IOException {
+      injectTestFailure(context, inputPath);
+
+      // Get the file information
+      FileStatus inputStat = getSourceFileStatus(context, inputPath);
+
+      // Verify if the output file exists and is the same that we want to copy
+      if (outputFs.exists(outputPath)) {
+        FileStatus outputStat = outputFs.getFileStatus(outputPath);
+        if (outputStat != null && sameFile(inputStat, outputStat)) {
+          LOG.info("Skip copy " + inputPath + " to " + outputPath + ", same file.");
+          return;
+        }
       }
 
+      FSDataInputStream in = openSourceFile(context, inputPath);
       try {
-        // Verify if the input file exists
-        FileStatus inputStat = getFileStatus(inputFs, inputPath);
-        if (inputStat == null) return false;
-
-        // Verify if the output file exists and is the same that we want to copy
-        if (outputFs.exists(outputPath)) {
-          FileStatus outputStat = outputFs.getFileStatus(outputPath);
-          if (sameFile(inputStat, outputStat)) {
-            LOG.info("Skip copy " + inputPath + " to " + outputPath + ", same file.");
-            return true;
-          }
-        }
-
         context.getCounter(Counter.BYTES_EXPECTED).increment(inputStat.getLen());
 
         // Ensure that the output folder is there and copy the file
         outputFs.mkdirs(outputPath.getParent());
         FSDataOutputStream out = outputFs.create(outputPath, true);
         try {
-          if (!copyData(context, inputPath, in, outputPath, out, inputStat.getLen()))
-            return false;
+          copyData(context, inputPath, in, outputPath, out, inputStat.getLen());
         } finally {
           out.close();
         }
 
-        // Preserve attributes
-        return preserveAttributes(outputPath, inputStat);
+        // Try to Preserve attributes
+        if (!preserveAttributes(outputPath, inputStat)) {
+          LOG.warn("You may have to run manually chown on: " + outputPath);
+        }
       } finally {
         in.close();
       }
     }
 
     /**
-     * Preserve the files attribute selected by the user copying them from the source file
+     * Try to Preserve the files attribute selected by the user copying them from the source file
+     * This is only required when you are exporting as a different user than "hbase" or on a system
+     * that doesn't have the "hbase" user.
+     *
+     * This is not considered a blocking failure since the user can force a chmod with the user
+     * that knows is available on the system.
      */
     private boolean preserveAttributes(final Path path, final FileStatus refStat) {
       FileStatus stat;
@@ -226,37 +272,47 @@ public final class ExportSnapshot extends Configured implements Tool {
           outputFs.setPermission(path, refStat.getPermission());
         }
       } catch (IOException e) {
-        LOG.error("Unable to set the permission for file=" + path, e);
+        LOG.warn("Unable to set the permission for file="+ stat.getPath() +": "+ e.getMessage());
         return false;
       }
 
-      try {
-        String user = (filesUser != null) ? filesUser : refStat.getOwner();
-        String group = (filesGroup != null) ? filesGroup : refStat.getGroup();
-        if (!(user.equals(stat.getOwner()) && group.equals(stat.getGroup()))) {
-          outputFs.setOwner(path, user, group);
+      String user = stringIsNotEmpty(filesUser) ? filesUser : refStat.getOwner();
+      String group = stringIsNotEmpty(filesGroup) ? filesGroup : refStat.getGroup();
+      if (stringIsNotEmpty(user) || stringIsNotEmpty(group)) {
+        try {
+          if (!(user.equals(stat.getOwner()) && group.equals(stat.getGroup()))) {
+            outputFs.setOwner(path, user, group);
+          }
+        } catch (IOException e) {
+          LOG.warn("Unable to set the owner/group for file="+ stat.getPath() +": "+ e.getMessage());
+          LOG.warn("The user/group may not exist on the destination cluster: user=" +
+                   user + " group=" + group);
+          return false;
         }
-      } catch (IOException e) {
-        LOG.error("Unable to set the owner/group for file=" + path, e);
-        return false;
       }
 
       return true;
     }
 
-    private boolean copyData(final Context context,
+    private boolean stringIsNotEmpty(final String str) {
+      return str != null && str.length() > 0;
+    }
+
+    private void copyData(final Context context,
         final Path inputPath, final FSDataInputStream in,
         final Path outputPath, final FSDataOutputStream out,
-        final long inputFileSize) {
+        final long inputFileSize)
+        throws IOException {
       final String statusMessage = "copied %s/" + StringUtils.humanReadableInt(inputFileSize) +
-                                   " (%.3f%%)";
+                                   " (%.1f%%)";
 
       try {
-        byte[] buffer = new byte[BUFFER_SIZE];
+        byte[] buffer = new byte[bufferSize];
         long totalBytesWritten = 0;
         int reportBytes = 0;
         int bytesRead;
 
+        long stime = System.currentTimeMillis();
         while ((bytesRead = in.read(buffer)) > 0) {
           out.write(buffer, 0, bytesRead);
           totalBytesWritten += bytesRead;
@@ -266,35 +322,45 @@ public final class ExportSnapshot extends Configured implements Tool {
             context.getCounter(Counter.BYTES_COPIED).increment(reportBytes);
             context.setStatus(String.format(statusMessage,
                               StringUtils.humanReadableInt(totalBytesWritten),
-                              totalBytesWritten/(float)inputFileSize) +
+                              (totalBytesWritten/(float)inputFileSize) * 100.0f) +
                               " from " + inputPath + " to " + outputPath);
             reportBytes = 0;
           }
         }
+        long etime = System.currentTimeMillis();
 
         context.getCounter(Counter.BYTES_COPIED).increment(reportBytes);
         context.setStatus(String.format(statusMessage,
                           StringUtils.humanReadableInt(totalBytesWritten),
-                          totalBytesWritten/(float)inputFileSize) +
+                          (totalBytesWritten/(float)inputFileSize) * 100.0f) +
                           " from " + inputPath + " to " + outputPath);
 
         // Verify that the written size match
         if (totalBytesWritten != inputFileSize) {
-          LOG.error("number of bytes copied not matching copied=" + totalBytesWritten +
-                    " expected=" + inputFileSize + " for file=" + inputPath);
-          context.getCounter(Counter.COPY_FAILED).increment(1);
-          return false;
+          String msg = "number of bytes copied not matching copied=" + totalBytesWritten +
+                       " expected=" + inputFileSize + " for file=" + inputPath;
+          throw new IOException(msg);
         }
 
-        return true;
+        LOG.info("copy completed for input=" + inputPath + " output=" + outputPath);
+        LOG.info("size=" + totalBytesWritten +
+            " (" + StringUtils.humanReadableInt(totalBytesWritten) + ")" +
+            " time=" + StringUtils.formatTimeDiff(etime, stime) +
+            String.format(" %.3fM/sec", (totalBytesWritten / ((etime - stime)/1000.0))/1048576.0));
+        context.getCounter(Counter.FILES_COPIED).increment(1);
       } catch (IOException e) {
         LOG.error("Error copying " + inputPath + " to " + outputPath, e);
         context.getCounter(Counter.COPY_FAILED).increment(1);
-        return false;
+        throw e;
       }
     }
 
-    private FSDataInputStream openSourceFile(final Path path) {
+    /**
+     * Try to open the "source" file.
+     * Throws an IOException if the communication with the inputFs fail or
+     * if the file is not found.
+     */
+    private FSDataInputStream openSourceFile(Context context, final Path path) throws IOException {
       try {
         if (HFileLink.isHFileLink(path) || StoreFileInfo.isReference(path)) {
           return new HFileLink(inputRoot, inputArchive, path).open(inputFs);
@@ -305,25 +371,30 @@ public final class ExportSnapshot extends Configured implements Tool {
         }
         return inputFs.open(path);
       } catch (IOException e) {
+        context.getCounter(Counter.MISSING_FILES).increment(1);
         LOG.error("Unable to open source file=" + path, e);
-        return null;
+        throw e;
       }
     }
 
-    private FileStatus getFileStatus(final FileSystem fs, final Path path) {
+    private FileStatus getSourceFileStatus(Context context, final Path path) throws IOException {
       try {
         if (HFileLink.isHFileLink(path) || StoreFileInfo.isReference(path)) {
           HFileLink link = new HFileLink(inputRoot, inputArchive, path);
-          return link.getFileStatus(fs);
+          return link.getFileStatus(inputFs);
         } else if (isHLogLinkPath(path)) {
           String serverName = path.getParent().getName();
           String logName = path.getName();
-          return new HLogLink(inputRoot, serverName, logName).getFileStatus(fs);
+          return new HLogLink(inputRoot, serverName, logName).getFileStatus(inputFs);
         }
-        return fs.getFileStatus(path);
+        return inputFs.getFileStatus(path);
+      } catch (FileNotFoundException e) {
+        context.getCounter(Counter.MISSING_FILES).increment(1);
+        LOG.error("Unable to get the status for source file=" + path, e);
+        throw e;
       } catch (IOException e) {
-        LOG.warn("Unable to get the status for file=" + path);
-        return null;
+        LOG.error("Unable to get the status for source file=" + path, e);
+        throw e;
       }
     }
 
@@ -479,10 +550,9 @@ public final class ExportSnapshot extends Configured implements Tool {
    * The number of input files created are based on the number of mappers provided as argument
    * and the number of the files to copy.
    */
-  private static Path[] createInputFiles(final Configuration conf,
+  private static Path[] createInputFiles(final Configuration conf, final Path inputFolderPath,
       final List<Pair<Path, Long>> snapshotFiles, int mappers)
       throws IOException, InterruptedException {
-    Path inputFolderPath = getInputFolderPath(conf);
     FileSystem fs = inputFolderPath.getFileSystem(conf);
     LOG.debug("Input folder location: " + inputFolderPath);
 
@@ -513,7 +583,8 @@ public final class ExportSnapshot extends Configured implements Tool {
   /**
    * Run Map-Reduce Job to perform the files copy.
    */
-  private boolean runCopyJob(final Path inputRoot, final Path outputRoot,
+  private void runCopyJob(final FileSystem inputFs, final Path inputRoot,
+      final FileSystem outputFs, final Path outputRoot,
       final List<Pair<Path, Long>> snapshotFiles, final boolean verifyChecksum,
       final String filesUser, final String filesGroup, final int filesMode,
       final int mappers) throws IOException, InterruptedException, ClassNotFoundException {
@@ -535,12 +606,49 @@ public final class ExportSnapshot extends Configured implements Tool {
     job.setOutputFormatClass(NullOutputFormat.class);
     job.setMapSpeculativeExecution(false);
     job.setNumReduceTasks(0);
-    for (Path path: createInputFiles(conf, snapshotFiles, mappers)) {
+
+    // Create MR Input
+    Path inputFolderPath = getInputFolderPath(conf);
+    for (Path path: createInputFiles(conf, inputFolderPath, snapshotFiles, mappers)) {
       LOG.debug("Add Input Path=" + path);
       SequenceFileInputFormat.addInputPath(job, path);
     }
 
-    return job.waitForCompletion(true);
+    UserProvider userProvider = UserProvider.instantiate(job.getConfiguration());
+    FsDelegationToken inputFsToken = new FsDelegationToken(userProvider, "irenewer");
+    FsDelegationToken outputFsToken = new FsDelegationToken(userProvider, "orenewer");
+    try {
+      // Acquire the delegation Tokens
+      inputFsToken.acquireDelegationToken(inputFs);
+      outputFsToken.acquireDelegationToken(outputFs);
+
+      // Run the MR Job
+      if (!job.waitForCompletion(true)) {
+        // TODO: Replace the fixed string with job.getStatus().getFailureInfo()
+        // when it will be available on all the supported versions.
+        throw new ExportSnapshotException("Copy Files Map-Reduce Job failed");
+      }
+    } finally {
+      inputFsToken.releaseDelegationToken();
+      outputFsToken.releaseDelegationToken();
+
+      // Remove MR Input
+      try {
+        inputFolderPath.getFileSystem(conf).delete(inputFolderPath, true);
+      } catch (IOException e) {
+        LOG.warn("Unable to remove MR input folder: " + inputFolderPath, e);
+      }
+    }
+  }
+
+  private void verifySnapshot(final Configuration baseConf,
+      final FileSystem fs, final Path rootDir, final Path snapshotDir) throws IOException {
+    // Update the conf with the current root dir, since may be a different cluster
+    Configuration conf = new Configuration(baseConf);
+    FSUtils.setRootDir(conf, rootDir);
+    FSUtils.setFsDefault(conf, snapshotDir);
+    SnapshotDescription snapshotDesc = SnapshotDescriptionUtils.readSnapshotInfo(fs, snapshotDir);
+    SnapshotReferenceUtil.verifySnapshot(conf, fs, snapshotDir, snapshotDesc);
   }
 
   /**
@@ -548,14 +656,17 @@ public final class ExportSnapshot extends Configured implements Tool {
    * @return 0 on success, and != 0 upon failure.
    */
   @Override
-  public int run(String[] args) throws Exception {
+  public int run(String[] args) throws IOException {
     boolean verifyChecksum = true;
     String snapshotName = null;
+    boolean overwrite = false;
     String filesGroup = null;
     String filesUser = null;
     Path outputRoot = null;
     int filesMode = 0;
-    int mappers = getConf().getInt("mapreduce.job.maps", 1);
+    int mappers = 0;
+
+    Configuration conf = getConf();
 
     // Process command line args
     for (int i = 0; i < args.length; i++) {
@@ -565,6 +676,11 @@ public final class ExportSnapshot extends Configured implements Tool {
           snapshotName = args[++i];
         } else if (cmd.equals("-copy-to")) {
           outputRoot = new Path(args[++i]);
+        } else if (cmd.equals("-copy-from")) {
+          Path sourceDir = new Path(args[++i]);
+          URI defaultFs = sourceDir.getFileSystem(conf).getUri();
+          FSUtils.setFsDefault(conf, new Path(defaultFs));
+          FSUtils.setRootDir(conf, sourceDir);
         } else if (cmd.equals("-no-checksum-verify")) {
           verifyChecksum = false;
         } else if (cmd.equals("-mappers")) {
@@ -575,6 +691,8 @@ public final class ExportSnapshot extends Configured implements Tool {
           filesGroup = args[++i];
         } else if (cmd.equals("-chmod")) {
           filesMode = Integer.parseInt(args[++i], 8);
+        } else if (cmd.equals("-overwrite")) {
+          overwrite = true;
         } else if (cmd.equals("-h") || cmd.equals("--help")) {
           printUsageAndExit();
         } else {
@@ -597,10 +715,11 @@ public final class ExportSnapshot extends Configured implements Tool {
       printUsageAndExit();
     }
 
-    Configuration conf = getConf();
     Path inputRoot = FSUtils.getRootDir(conf);
-    FileSystem inputFs = FileSystem.get(conf);
+    FileSystem inputFs = FileSystem.get(inputRoot.toUri(), conf);
+    LOG.debug("inputFs=" + inputFs.getUri().toString() + " inputRoot=" + inputRoot);
     FileSystem outputFs = FileSystem.get(outputRoot.toUri(), conf);
+    LOG.debug("outputFs=" + outputFs.getUri().toString() + " outputRoot=" + outputRoot.toString());
 
     Path snapshotDir = SnapshotDescriptionUtils.getCompletedSnapshotDir(snapshotName, inputRoot);
     Path snapshotTmpDir = SnapshotDescriptionUtils.getWorkingSnapshotDir(snapshotName, outputRoot);
@@ -608,32 +727,50 @@ public final class ExportSnapshot extends Configured implements Tool {
 
     // Check if the snapshot already exists
     if (outputFs.exists(outputSnapshotDir)) {
-      System.err.println("The snapshot '" + snapshotName +
-        "' already exists in the destination: " + outputSnapshotDir);
-      return 1;
+      if (overwrite) {
+        if (!outputFs.delete(outputSnapshotDir, true)) {
+          System.err.println("Unable to remove existing snapshot directory: " + outputSnapshotDir);
+          return 1;
+        }
+      } else {
+        System.err.println("The snapshot '" + snapshotName +
+          "' already exists in the destination: " + outputSnapshotDir);
+        return 1;
+      }
     }
 
     // Check if the snapshot already in-progress
     if (outputFs.exists(snapshotTmpDir)) {
-      System.err.println("A snapshot with the same name '" + snapshotName + "' may be in-progress");
-      System.err.println("Please check " + snapshotTmpDir + ". If the snapshot has completed, ");
-      System.err.println("consider removing " + snapshotTmpDir + " before retrying export"); 
-      return 1;
+      if (overwrite) {
+        if (!outputFs.delete(snapshotTmpDir, true)) {
+          System.err.println("Unable to remove existing snapshot tmp directory: " + snapshotTmpDir);
+          return 1;
+        }
+      } else {
+        System.err.println("A snapshot with the same name '"+ snapshotName +"' may be in-progress");
+        System.err.println("Please check " + snapshotTmpDir + ". If the snapshot has completed, ");
+        System.err.println("consider removing "+ snapshotTmpDir +" by using the -overwrite option");
+        return 1;
+      }
     }
 
     // Step 0 - Extract snapshot files to copy
+    LOG.info("Loading Snapshot hfile list");
     final List<Pair<Path, Long>> files = getSnapshotFiles(inputFs, snapshotDir);
+    if (mappers == 0 && files.size() > 0) {
+      mappers = 1 + (files.size() / conf.getInt(CONF_MAP_GROUP, 10));
+      mappers = Math.min(mappers, files.size());
+    }
 
     // Step 1 - Copy fs1:/.snapshot/<snapshot> to  fs2:/.snapshot/.tmp/<snapshot>
     // The snapshot references must be copied before the hfiles otherwise the cleaner
     // will remove them because they are unreferenced.
     try {
+      LOG.info("Copy Snapshot Manifest");
       FileUtil.copy(inputFs, snapshotDir, outputFs, snapshotTmpDir, false, false, conf);
     } catch (IOException e) {
-      System.err.println("Failed to copy the snapshot directory: from=" + snapshotDir +
-        " to=" + snapshotTmpDir);
-      e.printStackTrace(System.err);
-      return 1;
+      throw new ExportSnapshotException("Failed to copy the snapshot directory: from=" +
+        snapshotDir + " to=" + snapshotTmpDir, e);
     }
 
     // Step 2 - Start MR Job to copy files
@@ -643,24 +780,26 @@ public final class ExportSnapshot extends Configured implements Tool {
       if (files.size() == 0) {
         LOG.warn("There are 0 store file to be copied. There may be no data in the table.");
       } else {
-        if (!runCopyJob(inputRoot, outputRoot, files, verifyChecksum,
-            filesUser, filesGroup, filesMode, mappers)) {
-          throw new ExportSnapshotException("Snapshot export failed!");
-        }
+        runCopyJob(inputFs, inputRoot, outputFs, outputRoot, files, verifyChecksum,
+                   filesUser, filesGroup, filesMode, mappers);
       }
 
       // Step 3 - Rename fs2:/.snapshot/.tmp/<snapshot> fs2:/.snapshot/<snapshot>
+      LOG.info("Finalize the Snapshot Export");
       if (!outputFs.rename(snapshotTmpDir, outputSnapshotDir)) {
-        System.err.println("Snapshot export failed!");
-        System.err.println("Unable to rename snapshot directory from=" +
-                           snapshotTmpDir + " to=" + outputSnapshotDir);
-        return 1;
+        throw new ExportSnapshotException("Unable to rename snapshot directory from=" +
+          snapshotTmpDir + " to=" + outputSnapshotDir);
       }
 
+      // Step 4 - Verify snapshot validity
+      LOG.info("Verify snapshot validity");
+      verifySnapshot(conf, outputFs, outputRoot, outputSnapshotDir);
+
+      LOG.info("Export Completed: " + snapshotName);
       return 0;
     } catch (Exception e) {
-      System.err.println("Snapshot export failed!");
-      e.printStackTrace(System.err);
+      LOG.error("Snapshot export failed", e);
+      outputFs.delete(snapshotTmpDir, true);
       outputFs.delete(outputSnapshotDir, true);
       return 1;
     }
@@ -673,16 +812,22 @@ public final class ExportSnapshot extends Configured implements Tool {
     System.err.println("  -h|-help                Show this help and exit.");
     System.err.println("  -snapshot NAME          Snapshot to restore.");
     System.err.println("  -copy-to NAME           Remote destination hdfs://");
+    System.err.println("  -copy-from NAME         Input folder hdfs:// (default hbase.rootdir)");
     System.err.println("  -no-checksum-verify     Do not verify checksum.");
+    System.err.println("  -overwrite              Rewrite the snapshot manifest if already exists");
     System.err.println("  -chuser USERNAME        Change the owner of the files to the specified one.");
     System.err.println("  -chgroup GROUP          Change the group of the files to the specified one.");
     System.err.println("  -chmod MODE             Change the permission of the files to the specified one.");
     System.err.println("  -mappers                Number of mappers to use during the copy (mapreduce.job.maps).");
     System.err.println();
     System.err.println("Examples:");
-    System.err.println("  hbase " + getClass() + " \\");
-    System.err.println("    -snapshot MySnapshot -copy-to hdfs:///srv2:8082/hbase \\");
+    System.err.println("  hbase " + getClass().getName() + " \\");
+    System.err.println("    -snapshot MySnapshot -copy-to hdfs://srv2:8082/hbase \\");
     System.err.println("    -chuser MyUser -chgroup MyGroup -chmod 700 -mappers 16");
+    System.err.println();
+    System.err.println("  hbase " + getClass().getName() + " \\");
+    System.err.println("    -snapshot MySnapshot -copy-from hdfs://srv2:8082/hbase \\");
+    System.err.println("    -copy-to hdfs://srv1:50070/hbase \\");
     System.exit(1);
   }
 
@@ -698,6 +843,6 @@ public final class ExportSnapshot extends Configured implements Tool {
   }
 
   public static void main(String[] args) throws Exception {
-     System.exit(innerMain(HBaseConfiguration.create(), args));
+    System.exit(innerMain(HBaseConfiguration.create(), args));
   }
 }

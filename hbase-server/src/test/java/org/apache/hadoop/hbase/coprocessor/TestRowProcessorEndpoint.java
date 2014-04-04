@@ -114,7 +114,7 @@ public class TestRowProcessorEndpoint {
     Configuration conf = util.getConfiguration();
     conf.setStrings(CoprocessorHost.REGION_COPROCESSOR_CONF_KEY,
         RowProcessorEndpoint.class.getName());
-    conf.setInt(HConstants.HBASE_CLIENT_RETRIES_NUMBER, 1);
+    conf.setInt(HConstants.HBASE_CLIENT_RETRIES_NUMBER, 2);
     conf.setLong("hbase.hregion.row.processor.timeout", 1000L);
     util.startMiniCluster();
   }
@@ -173,7 +173,7 @@ public class TestRowProcessorEndpoint {
   public void testReadModifyWrite() throws Throwable {
     prepareTestData();
     failures.set(0);
-    int numThreads = 1000;
+    int numThreads = 100;
     concurrentExec(new IncrementRunner(), numThreads);
     Get get = new Get(ROW);
     LOG.debug("row keyvalues:" + stringifyKvs(table.get(get).listCells()));
@@ -234,7 +234,7 @@ public class TestRowProcessorEndpoint {
   public void testMultipleRows() throws Throwable {
     prepareTestData();
     failures.set(0);
-    int numThreads = 1000;
+    int numThreads = 100;
     concurrentExec(new SwapRowsRunner(), numThreads);
     LOG.debug("row keyvalues:" +
               stringifyKvs(table.get(new Get(ROW)).listCells()));

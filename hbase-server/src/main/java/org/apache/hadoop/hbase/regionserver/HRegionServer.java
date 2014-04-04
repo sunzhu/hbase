@@ -42,6 +42,7 @@ import java.util.Set;
 import java.util.SortedMap;
 import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ConcurrentSkipListMap;
@@ -49,6 +50,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import javax.management.ObjectName;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.protobuf.HBaseZeroCopyByteString;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
@@ -93,6 +95,7 @@ import org.apache.hadoop.hbase.client.Result;
 import org.apache.hadoop.hbase.client.RowMutations;
 import org.apache.hadoop.hbase.client.Scan;
 import org.apache.hadoop.hbase.coprocessor.CoprocessorHost;
+import org.apache.hadoop.hbase.DroppedSnapshotException;
 import org.apache.hadoop.hbase.exceptions.FailedSanityCheckException;
 import org.apache.hadoop.hbase.exceptions.OutOfOrderScannerNextException;
 import org.apache.hadoop.hbase.exceptions.RegionMovedException;
@@ -201,6 +204,7 @@ import org.apache.hadoop.hbase.security.UserProvider;
 import org.apache.hadoop.hbase.trace.SpanReceiverHost;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.CompressionTest;
+import org.apache.hadoop.hbase.util.Counter;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
 import org.apache.hadoop.hbase.util.FSTableDescriptors;
 import org.apache.hadoop.hbase.util.FSUtils;
@@ -226,7 +230,6 @@ import org.apache.hadoop.util.ReflectionUtils;
 import org.apache.hadoop.util.StringUtils;
 import org.apache.zookeeper.KeeperException;
 import org.apache.zookeeper.data.Stat;
-import org.cliffc.high_scale_lib.Counter;
 
 import com.google.protobuf.BlockingRpcChannel;
 import com.google.protobuf.ByteString;
@@ -248,6 +251,8 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
   public static final Log LOG = LogFactory.getLog(HRegionServer.class);
 
   private final Random rand;
+
+  private final AtomicLong scannerIdGen = new AtomicLong(0L);
 
   /*
    * Strings to be used in forming the exception message for
@@ -413,8 +418,8 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
   // zookeeper connection and watcher
   private ZooKeeperWatcher zooKeeper;
 
-  // master address manager and watcher
-  private MasterAddressTracker masterAddressManager;
+  // master address tracker
+  private MasterAddressTracker masterAddressTracker;
 
   // Cluster Status Tracker
   private ClusterStatusTracker clusterStatusTracker;
@@ -669,12 +674,12 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
     this.zooKeeper = new ZooKeeperWatcher(conf, REGIONSERVER + ":" +
       this.isa.getPort(), this);
 
-    // Create the master address manager, register with zk, and start it.  Then
+    // Create the master address tracker, register with zk, and start it.  Then
     // block until a master is available.  No point in starting up if no master
     // running.
-    this.masterAddressManager = new MasterAddressTracker(this.zooKeeper, this);
-    this.masterAddressManager.start();
-    blockAndCheckIfStopped(this.masterAddressManager);
+    this.masterAddressTracker = new MasterAddressTracker(this.zooKeeper, this);
+    this.masterAddressTracker.start();
+    blockAndCheckIfStopped(this.masterAddressTracker);
 
     // Wait on cluster being up.  Master will set this flag up in zookeeper
     // when ready.
@@ -989,7 +994,8 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
     return writeCount;
   }
 
-  void tryRegionServerReport(long reportStartTime, long reportEndTime)
+  @VisibleForTesting
+  protected void tryRegionServerReport(long reportStartTime, long reportEndTime)
   throws IOException {
     if (this.rssStub == null) {
       // the current server is stopping.
@@ -1506,8 +1512,8 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
   /**
    * @return Master address tracker instance.
    */
-  public MasterAddressTracker getMasterAddressManager() {
-    return this.masterAddressManager;
+  public MasterAddressTracker getMasterAddressTracker() {
+    return this.masterAddressTracker;
   }
 
   /*
@@ -1636,8 +1642,8 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
     // Verify that all threads are alive
     if (!(leases.isAlive()
         && cacheFlusher.isAlive() && hlogRoller.isAlive()
-        && this.compactionChecker.isAlive())
-        && this.periodicFlusher.isAlive()) {
+        && this.compactionChecker.isAlive()
+        && this.periodicFlusher.isAlive())) {
       stop("One or more threads are no longer alive -- stop");
       return false;
     }
@@ -1869,7 +1875,7 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
     boolean refresh = false; // for the first time, use cached data
     RegionServerStatusService.BlockingInterface intf = null;
     while (keepLooping() && master == null) {
-      sn = this.masterAddressManager.getMasterAddress(refresh);
+      sn = this.masterAddressTracker.getMasterAddress(refresh);
       if (sn == null) {
         if (!keepLooping()) {
           // give up with no connection.
@@ -2601,9 +2607,11 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
       String regionNameStr = regionName == null?
         encodedRegionName: Bytes.toStringBinary(regionName);
       if (isOpening != null && isOpening.booleanValue()) {
-        throw new RegionOpeningException("Region " + regionNameStr + " is opening");
+        throw new RegionOpeningException("Region " + regionNameStr + 
+          " is opening on " + this.serverNameFromMasterPOV);
       }
-      throw new NotServingRegionException("Region " + regionNameStr + " is not online");
+      throw new NotServingRegionException("Region " + regionNameStr + 
+        " is not online on " + this.serverNameFromMasterPOV);
     }
     return region;
   }
@@ -2705,18 +2713,16 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
   }
 
   protected long addScanner(RegionScanner s, HRegion r) throws LeaseStillHeldException {
-    long scannerId = -1;
-    while (true) {
-      scannerId = Math.abs(rand.nextLong() << 24) ^ startcode;
-      String scannerName = String.valueOf(scannerId);
-      RegionScannerHolder existing =
-        scanners.putIfAbsent(scannerName, new RegionScannerHolder(s, r));
-      if (existing == null) {
-        this.leases.createLease(scannerName, this.scannerLeaseTimeoutPeriod,
-          new ScannerListener(scannerName));
-        break;
-      }
-    }
+    long scannerId = this.scannerIdGen.incrementAndGet();
+    String scannerName = String.valueOf(scannerId);
+
+    RegionScannerHolder existing =
+      scanners.putIfAbsent(scannerName, new RegionScannerHolder(s, r));
+    assert existing == null : "scannerId must be unique within regionserver's whole lifecycle!";
+
+    this.leases.createLease(scannerName, this.scannerLeaseTimeoutPeriod,
+        new ScannerListener(scannerName));
+
     return scannerId;
   }
 
@@ -3481,6 +3487,15 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
       throw new ServiceException(ie);
     }
     requestCount.increment();
+    if (request.hasServerStartCode() && this.serverNameFromMasterPOV != null) {
+      // check that we are the same server that this RPC is intended for.
+      long serverStartCode = request.getServerStartCode();
+      if (this.serverNameFromMasterPOV.getStartcode() !=  serverStartCode) {
+        throw new ServiceException(new DoNotRetryIOException("This RPC was intended for a " +
+            "different server with startCode: " + serverStartCode + ", this server is: "
+            + this.serverNameFromMasterPOV));
+      }
+    }
     OpenRegionResponse.Builder builder = OpenRegionResponse.newBuilder();
     final int regionCount = request.getOpenInfoCount();
     final Map<TableName, HTableDescriptor> htds =
@@ -3638,6 +3653,15 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
 
     try {
       checkOpen();
+      if (request.hasServerStartCode() && this.serverNameFromMasterPOV != null) {
+        // check that we are the same server that this RPC is intended for.
+        long serverStartCode = request.getServerStartCode();
+        if (this.serverNameFromMasterPOV.getStartcode() !=  serverStartCode) {
+          throw new ServiceException(new DoNotRetryIOException("This RPC was intended for a " +
+              "different server with startCode: " + serverStartCode + ", this server is: "
+              + this.serverNameFromMasterPOV));
+        }
+      }
       final String encodedRegionName = ProtobufUtil.getRegionEncodedName(request.getRegion());
 
       // Can be null if we're calling close on a region that's not online
@@ -3689,6 +3713,13 @@ public class HRegionServer implements ClientProtos.ClientService.BlockingInterfa
       }
       builder.setLastFlushTime(region.getLastFlushTime());
       return builder.build();
+    } catch (DroppedSnapshotException ex) {
+      // Cache flush can fail in a few places. If it fails in a critical
+      // section, we get a DroppedSnapshotException and a replay of hlog
+      // is required. Currently the only way to do this is a restart of
+      // the server.
+      abort("Replay of HLog required. Forcing server shutdown", ex);
+      throw new ServiceException(ex);
     } catch (IOException ie) {
       throw new ServiceException(ie);
     }

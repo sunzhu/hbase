@@ -478,7 +478,7 @@
             <parallel>classes</parallel>
             <!-- surefire hack, if not we're
               using method parallelization class ! -->
-            <testFailureIgnore>false</testFailureIgnore>
+            <testFailureIgnore>${surefire.testFailureIgnore}</testFailureIgnore>
             <forkedProcessTimeoutInSeconds>${surefire.timeout}</forkedProcessTimeoutInSeconds>
             <argLine>-enableassertions -Xmx1900m -XX:MaxPermSize=100m -Djava.security.egd=file:/dev/./urandom -Djava.net.preferIPv4Stack=true -Djava.awt.headless=true</argLine>
             <redirectTestOutputToFile>${test.output.tofile}</redirectTestOutputToFile>
@@ -492,8 +492,8 @@
               </goals>
               <configuration>
                 <skip>${surefire.skipSecondPart}</skip>
-                <testFailureIgnore>false</testFailureIgnore>
-                <forkMode>perThread</forkMode>
+                <testFailureIgnore>${surefire.testFailureIgnore}</testFailureIgnore>
+                <forkMode>${surefire.secondPartForkMode}</forkMode>
                 <perCoreThreadCount>false</perCoreThreadCount>
                 <threadCount>${surefire.secondPartThreadCount}</threadCount>
                 <parallel>classes</parallel>
@@ -860,7 +860,7 @@
     <commons-io.version>2.4</commons-io.version>
     <commons-lang.version>2.6</commons-lang.version>
     <commons-logging.version>1.1.1</commons-logging.version>
-    <commons-math.version>2.2</commons-math.version>
+    <commons-math.version>2.1</commons-math.version>
     <collections.version>3.2.1</collections.version>
     <httpclient.version>3.1</httpclient.version>
     <metrics-core.version>2.1.2</metrics-core.version>
@@ -914,10 +914,12 @@
     <surefire.skipSecondPart>false</surefire.skipSecondPart>
     <surefire.firstPartForkMode>once</surefire.firstPartForkMode>
     <surefire.firstPartParallel>classes</surefire.firstPartParallel>
+    <surefire.secondPartForkMode>perThread</surefire.secondPartForkMode>
     <surefire.firstPartThreadCount>1</surefire.firstPartThreadCount>
     <surefire.secondPartThreadCount>2</surefire.secondPartThreadCount>
     <surefire.firstPartGroups>org.apache.hadoop.hbase.SmallTests</surefire.firstPartGroups>
     <surefire.secondPartGroups>org.apache.hadoop.hbase.MediumTests</surefire.secondPartGroups>
+    <surefire.testFailureIgnore>false</surefire.testFailureIgnore>
     <test.output.tofile>true</test.output.tofile>
     <surefire.timeout>900</surefire.timeout>
   </properties>
@@ -1084,11 +1086,6 @@
         <version>${commons-cli.version}</version>
       </dependency>
       <dependency>
-        <groupId>com.github.stephenc.high-scale-lib</groupId>
-        <artifactId>high-scale-lib</artifactId>
-        <version>1.1.1</version>
-      </dependency>
-      <dependency>
         <groupId>commons-codec</groupId>
         <artifactId>commons-codec</artifactId>
         <version>${commons-codec.version}</version>
@@ -1187,6 +1184,10 @@
         <artifactId>jsp-2.1</artifactId>
         <version>${jetty.jspapi.version}</version>
         <exclusions>
+          <exclusion>
+            <groupId>org.eclipse.jdt</groupId>
+            <artifactId>core</artifactId>
+          </exclusion>
           <exclusion>
             <groupId>ant</groupId>
             <artifactId>ant</artifactId>
@@ -1413,7 +1414,7 @@
               <groupId>org.apache.maven.plugins</groupId>
               <artifactId>maven-surefire-plugin</artifactId>
               <configuration>
-                <argLine>-enableassertions -Xmx1900m -Djava.security.egd=file:/dev/./urandom -Djava.net.preferIPv4Stack=true "-Djava.library.path=${hadoop.library.path};${java.library.path}"</argLine>
+                <argLine>-enableassertions -Xmx1900m -XX:MaxPermSize=256m -Djava.security.egd=file:/dev/./urandom -Djava.net.preferIPv4Stack=true "-Djava.library.path=${hadoop.library.path};${java.library.path}"</argLine>
                 <systemProperties>
                   <property>
                     <name>java.net.preferIPv4Stack</name>

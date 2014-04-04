@@ -37,7 +37,6 @@ import org.apache.hadoop.classification.InterfaceStability;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.Abortable;
 import org.apache.hadoop.hbase.ClusterStatus;
-import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.HBaseIOException;
 import org.apache.hadoop.hbase.HColumnDescriptor;
@@ -45,12 +44,13 @@ import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.HRegionInfo;
 import org.apache.hadoop.hbase.HRegionLocation;
 import org.apache.hadoop.hbase.HTableDescriptor;
-import org.apache.hadoop.hbase.NamespaceDescriptor;
 import org.apache.hadoop.hbase.MasterNotRunningException;
+import org.apache.hadoop.hbase.NamespaceDescriptor;
 import org.apache.hadoop.hbase.NotServingRegionException;
 import org.apache.hadoop.hbase.RegionException;
 import org.apache.hadoop.hbase.ServerName;
 import org.apache.hadoop.hbase.TableExistsException;
+import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.TableNotDisabledException;
 import org.apache.hadoop.hbase.TableNotEnabledException;
 import org.apache.hadoop.hbase.TableNotFoundException;
@@ -61,12 +61,7 @@ import org.apache.hadoop.hbase.catalog.MetaReader;
 import org.apache.hadoop.hbase.client.MetaScanner.MetaScannerVisitor;
 import org.apache.hadoop.hbase.client.MetaScanner.MetaScannerVisitorBase;
 import org.apache.hadoop.hbase.exceptions.DeserializationException;
-import org.apache.hadoop.hbase.regionserver.wal.FailedLogCloseException;
-import org.apache.hadoop.hbase.snapshot.HBaseSnapshotException;
 import org.apache.hadoop.hbase.exceptions.MergeRegionException;
-import org.apache.hadoop.hbase.snapshot.RestoreSnapshotException;
-import org.apache.hadoop.hbase.snapshot.SnapshotCreationException;
-import org.apache.hadoop.hbase.snapshot.UnknownSnapshotException;
 import org.apache.hadoop.hbase.ipc.CoprocessorRpcChannel;
 import org.apache.hadoop.hbase.ipc.MasterCoprocessorRpcChannel;
 import org.apache.hadoop.hbase.ipc.PayloadCarryingRpcController;
@@ -127,6 +122,11 @@ import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SnapshotRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.SnapshotResponse;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.StopMasterRequest;
 import org.apache.hadoop.hbase.protobuf.generated.MasterProtos.UnassignRegionRequest;
+import org.apache.hadoop.hbase.regionserver.wal.FailedLogCloseException;
+import org.apache.hadoop.hbase.snapshot.HBaseSnapshotException;
+import org.apache.hadoop.hbase.snapshot.RestoreSnapshotException;
+import org.apache.hadoop.hbase.snapshot.SnapshotCreationException;
+import org.apache.hadoop.hbase.snapshot.UnknownSnapshotException;
 import org.apache.hadoop.hbase.snapshot.ClientSnapshotDescriptionUtils;
 import org.apache.hadoop.hbase.util.Addressing;
 import org.apache.hadoop.hbase.util.Bytes;
@@ -618,7 +618,6 @@ public class HBaseAdmin implements Abortable, Closeable {
    * @throws IOException if a remote or network exception occurs
    */
   public void deleteTable(final TableName tableName) throws IOException {
-    HRegionLocation firstMetaServer = getFirstMetaServerForTable(tableName);
     boolean tableExists = true;
 
     executeCallable(new MasterCallable<Void>(getConnection()) {
@@ -630,10 +629,11 @@ public class HBaseAdmin implements Abortable, Closeable {
       }
     });
 
+    int failures = 0;
     // Wait until all regions deleted
     for (int tries = 0; tries < (this.numRetries * this.retryLongerMultiplier); tries++) {
       try {
-
+        HRegionLocation firstMetaServer = getFirstMetaServerForTable(tableName);
         Scan scan = MetaReader.getScanForTableName(tableName);
         scan.addColumn(HConstants.CATALOG_FAMILY, HConstants.REGIONINFO_QUALIFIER);
         ScanRequest request = RequestConverter.buildScanRequest(
@@ -672,7 +672,8 @@ public class HBaseAdmin implements Abortable, Closeable {
           }
         }
       } catch (IOException ex) {
-        if(tries == numRetries - 1) {           // no more tries left
+        failures++;
+        if(failures == numRetries - 1) {           // no more tries left
           if (ex instanceof RemoteException) {
             throw ((RemoteException) ex).unwrapRemoteException();
           } else {
@@ -1373,7 +1374,7 @@ public class HBaseAdmin implements Abortable, Closeable {
     AdminService.BlockingInterface admin = this.connection.getAdmin(sn);
     // Close the region without updating zk state.
     CloseRegionRequest request =
-      RequestConverter.buildCloseRegionRequest(encodedRegionName, false);
+      RequestConverter.buildCloseRegionRequest(sn, encodedRegionName, false);
     try {
       CloseRegionResponse response = admin.closeRegion(null, request);
       boolean isRegionClosed = response.getClosed();
@@ -1397,7 +1398,7 @@ public class HBaseAdmin implements Abortable, Closeable {
   throws IOException {
     AdminService.BlockingInterface admin = this.connection.getAdmin(sn);
     // Close the region without updating zk state.
-    ProtobufUtil.closeRegion(admin, hri.getRegionName(), false);
+    ProtobufUtil.closeRegion(admin, sn, hri.getRegionName(), false);
   }
 
   /**
@@ -1733,7 +1734,16 @@ public class HBaseAdmin implements Abortable, Closeable {
   }
 
   /**
-   * Special method, only used by hbck.
+   * Offline specified region from master's in-memory state. It will not attempt to reassign the
+   * region as in unassign. This API can be used when a region not served by any region server and
+   * still online as per Master's in memory state. If this API is incorrectly used on active region
+   * then master will loose track of that region.
+   *
+   * This is a special method that should be used by experts or hbck.
+   *
+   * @param regionName
+   *          Region to offline.
+   * @throws IOException
    */
   public void offline(final byte [] regionName)
   throws IOException {

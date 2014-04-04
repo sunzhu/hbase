@@ -283,8 +283,8 @@ MasterServices, Server {
   private DrainingServerTracker drainingServerTracker;
   // Tracker for load balancer state
   private LoadBalancerTracker loadBalancerTracker;
-  // master address manager and watcher
-  private MasterAddressTracker masterAddressManager;
+  // master address tracker
+  private MasterAddressTracker masterAddressTracker;
 
   // RPC server for the HMaster
   private final RpcServerInterface rpcServer;
@@ -575,8 +575,8 @@ MasterServices, Server {
     startupStatus.setDescription("Master startup");
     masterStartTime = System.currentTimeMillis();
     try {
-      this.masterAddressManager = new MasterAddressTracker(getZooKeeperWatcher(), this);
-      this.masterAddressManager.start();
+      this.masterAddressTracker = new MasterAddressTracker(getZooKeeperWatcher(), this);
+      this.masterAddressTracker.start();
 
       // Put up info server.
       int port = this.conf.getInt("hbase.master.info.port", 60010);
@@ -1159,8 +1159,8 @@ MasterServices, Server {
     return this.activeMasterManager;
   }
 
-  public MasterAddressTracker getMasterAddressManager() {
-    return this.masterAddressManager;
+  public MasterAddressTracker getMasterAddressTracker() {
+    return this.masterAddressTracker;
   }
 
   /*
@@ -1348,10 +1348,13 @@ MasterServices, Server {
       RpcController controller, RegionServerReportRequest request) throws ServiceException {
     try {
       ClusterStatusProtos.ServerLoad sl = request.getLoad();
-      this.serverManager.regionServerReport(ProtobufUtil.toServerName(request.getServer()), new ServerLoad(sl));
+      ServerName serverName = ProtobufUtil.toServerName(request.getServer());
+      ServerLoad oldLoad = serverManager.getLoad(serverName);
+      this.serverManager.regionServerReport(serverName, new ServerLoad(sl));
       if (sl != null && this.metricsMaster != null) {
         // Up our metrics.
-        this.metricsMaster.incrementRequests(sl.getTotalNumberOfRequests());
+        this.metricsMaster.incrementRequests(sl.getTotalNumberOfRequests()
+          - (oldLoad != null ? oldLoad.getTotalNumberOfRequests() : 0));
       }
     } catch (IOException ioe) {
       throw new ServiceException(ioe);
@@ -2925,6 +2928,14 @@ MasterServices, Server {
       this.snapshotManager.checkSnapshotSupport();
     } catch (UnsupportedOperationException e) {
       throw new ServiceException(e);
+    }
+
+    // ensure namespace exists
+    try {
+      TableName dstTable = TableName.valueOf(request.getSnapshot().getTable());
+      getNamespaceDescriptor(dstTable.getNamespaceAsString());
+    } catch (IOException ioe) {
+      throw new ServiceException(ioe);
     }
 
     try {

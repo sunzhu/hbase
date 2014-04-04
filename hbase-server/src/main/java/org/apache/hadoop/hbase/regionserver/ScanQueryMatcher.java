@@ -183,8 +183,9 @@ public class ScanQueryMatcher {
 
       // We can share the ExplicitColumnTracker, diff is we reset
       // between rows, not between storefiles.
-      this.columns = new ExplicitColumnTracker(columns,
-          scanInfo.getMinVersions(), maxVersions, oldestUnexpiredTS);
+      byte[] attr = scan.getAttribute(Scan.HINT_LOOKAHEAD);
+      this.columns = new ExplicitColumnTracker(columns, scanInfo.getMinVersions(), maxVersions,
+          oldestUnexpiredTS, attr == null ? 0 : Bytes.toInt(attr));
     }
   }
 
@@ -323,9 +324,12 @@ public class ScanQueryMatcher {
         }
         // Can't early out now, because DelFam come before any other keys
       }
-      if (retainDeletesInOutput
-          || (!isUserScan && (EnvironmentEdgeManager.currentTimeMillis() - timestamp) <= timeToPurgeDeletes)
-          || kv.getMvccVersion() > maxReadPointToTrackVersions) {
+     
+      if ((!isUserScan)
+          && timeToPurgeDeletes > 0
+          && (EnvironmentEdgeManager.currentTimeMillis() - timestamp) <= timeToPurgeDeletes) {
+        return MatchCode.INCLUDE;
+      } else if (retainDeletesInOutput || kv.getMvccVersion() > maxReadPointToTrackVersions) {
         // always include or it is not time yet to check whether it is OK
         // to purge deltes or not
         if (!isUserScan) {

@@ -61,6 +61,9 @@ import org.apache.hadoop.hbase.exceptions.DeserializationException;
 import org.apache.hadoop.hbase.executor.EventHandler;
 import org.apache.hadoop.hbase.executor.EventType;
 import org.apache.hadoop.hbase.executor.ExecutorService;
+import org.apache.hadoop.hbase.ipc.RpcClient;
+import org.apache.hadoop.hbase.ipc.RpcClient.FailedServerException;
+import org.apache.hadoop.hbase.ipc.RpcClient.FailedServerException;
 import org.apache.hadoop.hbase.ipc.ServerNotRunningYetException;
 import org.apache.hadoop.hbase.master.RegionState.State;
 import org.apache.hadoop.hbase.master.balancer.FavoredNodeAssignmentHelper;
@@ -1692,7 +1695,9 @@ public class AssignmentManager extends ZooKeeperListener {
           t = ((RemoteException)t).unwrapRemoteException();
         }
         if (t instanceof NotServingRegionException
-            || t instanceof RegionServerStoppedException) {
+            || t instanceof RegionServerStoppedException
+            || t instanceof ServerNotRunningYetException
+            || t instanceof FailedServerException) {
           LOG.debug("Offline " + region.getRegionNameAsString()
             + ", it's not any more on " + server, t);
           if (transitionInZK) {
@@ -1840,12 +1845,14 @@ public class AssignmentManager extends ZooKeeperListener {
       final boolean setOfflineInZK, final boolean forceNewPlan) {
     long startTime = EnvironmentEdgeManager.currentTimeMillis();
     try {
+      Configuration conf = server.getConfiguration();
       RegionState currentState = state;
       int versionOfOfflineNode = -1;
       RegionPlan plan = null;
       long maxWaitTime = -1;
       HRegionInfo region = state.getRegion();
       RegionOpeningState regionOpenState;
+      Throwable previousException = null;
       for (int i = 1; i <= maximumAttempts; i++) {
         if (server.isStopped() || server.isAborted()) {
           LOG.info("Skip assigning " + region.getRegionNameAsString()
@@ -1944,6 +1951,7 @@ public class AssignmentManager extends ZooKeeperListener {
           if (t instanceof RemoteException) {
             t = ((RemoteException) t).unwrapRemoteException();
           }
+          previousException = t;
 
           // Should we wait a little before retrying? If the server is starting it's yes.
           // If the region is already in transition, it's yes as well: we want to be sure that
@@ -2044,6 +2052,22 @@ public class AssignmentManager extends ZooKeeperListener {
             currentState = regionStates.updateRegionState(region, State.OFFLINE);
             versionOfOfflineNode = -1;
             plan = newPlan;
+          } else if(plan.getDestination().equals(newPlan.getDestination()) &&
+              previousException instanceof FailedServerException) {
+            try {
+              LOG.info("Trying to re-assign " + region.getRegionNameAsString() + 
+                " to the same failed server.");
+              Thread.sleep(1 + conf.getInt(RpcClient.FAILED_SERVER_EXPIRY_KEY, 
+                RpcClient.FAILED_SERVER_EXPIRY_DEFAULT));
+            } catch (InterruptedException ie) {
+              LOG.warn("Failed to assign "
+                  + region.getRegionNameAsString() + " since interrupted", ie);
+              Thread.currentThread().interrupt();
+              if (!tomActivated) {
+                regionStates.updateRegionState(region, State.FAILED_OPEN);
+              }
+              return;
+            }
           }
         }
       }
@@ -2116,7 +2140,7 @@ public class AssignmentManager extends ZooKeeperListener {
    * if no servers to assign, it returns null).
    */
   private RegionPlan getRegionPlan(final HRegionInfo region,
-      final boolean forceNewPlan)  throws HBaseIOException  {
+      final boolean forceNewPlan)  throws HBaseIOException {
     return getRegionPlan(region, null, forceNewPlan);
   }
 
@@ -3172,6 +3196,7 @@ public class AssignmentManager extends ZooKeeperListener {
   }
 
   public void stop() {
+    shutdown(); // Stop executor service, etc
     if (tomActivated){
       this.timeoutMonitor.interrupt();
       this.timerUpdater.interrupt();

@@ -79,9 +79,9 @@ import org.apache.hadoop.hbase.regionserver.BloomType;
 import org.apache.hadoop.hbase.regionserver.HStore;
 import org.apache.hadoop.hbase.regionserver.StoreFile;
 import org.apache.hadoop.hbase.security.UserProvider;
+import org.apache.hadoop.hbase.security.token.FsDelegationToken;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.Pair;
-import org.apache.hadoop.security.token.Token;
 import org.apache.hadoop.util.Tool;
 import org.apache.hadoop.util.ToolRunner;
 
@@ -109,8 +109,7 @@ public class LoadIncrementalHFiles extends Configured implements Tool {
   private int maxFilesPerRegionPerFamily;
   private boolean assignSeqIds;
 
-  private boolean hasForwardedToken;
-  private Token<?> userToken;
+  private FsDelegationToken fsDelegationToken;
   private String bulkToken;
   private UserProvider userProvider;
 
@@ -122,6 +121,7 @@ public class LoadIncrementalHFiles extends Configured implements Tool {
     getConf().setFloat(HConstants.HFILE_BLOCK_CACHE_SIZE_KEY, 0);
     this.hbAdmin = new HBaseAdmin(conf);
     this.userProvider = UserProvider.instantiate(conf);
+    this.fsDelegationToken = new FsDelegationToken(userProvider, "renewer");
     assignSeqIds = conf.getBoolean(ASSIGN_SEQ_IDS, true);
     maxFilesPerRegionPerFamily = conf.getInt(MAX_FILES_PER_REGION_PER_FAMILY, 32);
   }
@@ -260,19 +260,8 @@ public class LoadIncrementalHFiles extends Configured implements Tool {
       //prepare staging directory and token
       if (userProvider.isHBaseSecurityEnabled()) {
         FileSystem fs = FileSystem.get(getConf());
-        //This condition is here for unit testing
-        //Since delegation token doesn't work in mini cluster
-        if (userProvider.isHadoopSecurityEnabled()) {
-          userToken = userProvider.getCurrent().getToken("HDFS_DELEGATION_TOKEN",
-                                                         fs.getCanonicalServiceName());
-          if (userToken == null) {
-            hasForwardedToken = false;
-            userToken = fs.getDelegationToken("renewer");
-          } else {
-            hasForwardedToken = true;
-            LOG.info("Use the existing token: " + userToken);
-          }
-        }
+        fsDelegationToken.acquireDelegationToken(fs);
+
         bulkToken = new SecureBulkLoadClient(table).prepareBulkLoad(table.getName());
       }
 
@@ -311,13 +300,8 @@ public class LoadIncrementalHFiles extends Configured implements Tool {
 
     } finally {
       if (userProvider.isHBaseSecurityEnabled()) {
-        if (userToken != null && !hasForwardedToken) {
-          try {
-            userToken.cancel(getConf());
-          } catch (Exception e) {
-            LOG.warn("Failed to cancel HDFS delegation token.", e);
-          }
-        }
+        fsDelegationToken.releaseDelegationToken();
+
         if(bulkToken != null) {
           new SecureBulkLoadClient(table).cleanupBulkLoad(bulkToken);
         }
@@ -505,6 +489,7 @@ public class LoadIncrementalHFiles extends Configured implements Tool {
    * LQI's corresponding to the resultant hfiles.
    *
    * protected for testing
+   * @throws IOException
    */
   protected List<LoadQueueItem> groupOrSplit(Multimap<ByteBuffer, LoadQueueItem> regionGroups,
       final LoadQueueItem item, final HTable table,
@@ -545,6 +530,30 @@ public class LoadIncrementalHFiles extends Configured implements Tool {
       idx = -(idx + 1) - 1;
     }
     final int indexForCallable = idx;
+
+    /**
+     * we can consider there is a region hole in following conditions. 1) if idx < 0,then first
+     * region info is lost. 2) if the endkey of a region is not equal to the startkey of the next
+     * region. 3) if the endkey of the last region is not empty.
+     */
+    if (indexForCallable < 0) {
+      throw new IOException("The first region info for table "
+          + Bytes.toString(table.getTableName())
+          + " cann't be found in hbase:meta.Please use hbck tool to fix it first.");
+    } else if ((indexForCallable == startEndKeys.getFirst().length - 1)
+        && !Bytes.equals(startEndKeys.getSecond()[indexForCallable], HConstants.EMPTY_BYTE_ARRAY)) {
+      throw new IOException("The last region info for table "
+          + Bytes.toString(table.getTableName())
+          + " cann't be found in hbase:meta.Please use hbck tool to fix it first.");
+    } else if (indexForCallable + 1 < startEndKeys.getFirst().length
+        && !(Bytes.compareTo(startEndKeys.getSecond()[indexForCallable],
+          startEndKeys.getFirst()[indexForCallable + 1]) == 0)) {
+      throw new IOException("The endkey of one region for table "
+          + Bytes.toString(table.getTableName())
+          + " is not equal to the startkey of the next region in hbase:meta."
+          + "Please use hbck tool to fix it first.");
+    }
+
     boolean lastKeyInRange =
       Bytes.compareTo(last, startEndKeys.getSecond()[idx]) < 0 ||
       Bytes.equals(startEndKeys.getSecond()[idx], HConstants.EMPTY_BYTE_ARRAY);
@@ -608,8 +617,8 @@ public class LoadIncrementalHFiles extends Configured implements Tool {
           } else {
             HTable table = new HTable(conn.getConfiguration(), getTableName());
             secureClient = new SecureBulkLoadClient(table);
-            success = secureClient.bulkLoadHFiles(famPaths, userToken, bulkToken,
-              getLocation().getRegionInfo().getStartKey());
+            success = secureClient.bulkLoadHFiles(famPaths, fsDelegationToken.getUserToken(),
+              bulkToken, getLocation().getRegionInfo().getStartKey());
           }
           return success;
         } finally {

@@ -28,13 +28,17 @@
 #     Default is ${HADOOP_CONF_DIR}/regionservers
 #   HADOOP_CONF_DIR  Alternate conf dir. Default is ${HADOOP_HOME}/conf.
 #   HBASE_CONF_DIR  Alternate hbase conf dir. Default is ${HBASE_HOME}/conf.
-#   HADOOP_SLAVE_SLEEP Seconds to sleep between spawning remote commands.
-#   HADOOP_SLAVE_TIMEOUT Seconds to wait for timing out a remote command. 
-#   HADOOP_SSH_OPTS Options passed to ssh when running remote commands.
+#   HBASE_SLAVE_SLEEP Seconds to sleep between spawning remote commands.
+#   HBASE_SLAVE_TIMEOUT Seconds to wait for timing out a remote command. 
+#   HBASE_SSH_OPTS Options passed to ssh when running remote commands.
 #
 # Modelled after $HADOOP_HOME/bin/slaves.sh.
 
-usage="Usage: $0 [--config <hbase-confdir>] [--rs-only] [--master-only] [--graceful]"
+usage_str="Usage: `basename $0` [--config <hbase-confdir>] [--rs-only] [--master-only] [--graceful] [--maxthreads xx]"
+
+function usage() {
+  echo "${usage_str}"
+}
 
 bin=`dirname "$0"`
 bin=`cd "$bin">/dev/null; pwd`
@@ -48,35 +52,42 @@ then
   exit $errCode
 fi
 
-function usage() {
-  echo $usage
-  exit 1
-}
-
-
 RR_RS=1
 RR_MASTER=1
 RR_GRACEFUL=0
+RR_MAXTHREADS=1
 
-for x in "$@" ; do
-  case "$x" in
+while [ $# -gt 0 ]; do
+  case "$1" in
     --rs-only|-r)
       RR_RS=1
       RR_MASTER=0
       RR_GRACEFUL=0
+      shift
       ;;
     --master-only)
       RR_RS=0
       RR_MASTER=1
       RR_GRACEFUL=0
+      shift
       ;;
     --graceful)
       RR_RS=0
       RR_MASTER=0
       RR_GRACEFUL=1
+      shift
+      ;;
+    --maxthreads)
+      shift
+      RR_MAXTHREADS=$1
+      shift
+      ;;
+    --help|-h)
+      usage
+      exit 0
       ;;
     *)
-      echo Bad argument: $x
+      echo Bad argument: $1
       usage
       exit 1
       ;;
@@ -85,7 +96,7 @@ done
 
 # quick function to get a value from the HBase config file
 # HBASE-6504 - only take the first line of the output in case verbose gc is on
-distMode=`$bin/hbase org.apache.hadoop.hbase.util.HBaseConfTool hbase.cluster.distributed | head -n 1`
+distMode=`HBASE_CONF_DIR=${HBASE_CONF_DIR} $bin/hbase org.apache.hadoop.hbase.util.HBaseConfTool hbase.cluster.distributed | head -n 1`
 if [ "$distMode" == 'false' ]; then
   if [ $RR_RS -ne 1 ] || [ $RR_MASTER -ne 1 ]; then
     echo Cant do selective rolling restart if not running distributed
@@ -158,7 +169,7 @@ else
         rs_parts=(${rs//,/ })
         hostname=${rs_parts[0]}
         echo "Gracefully restarting: $hostname"
-        "$bin"/graceful_stop.sh --config "${HBASE_CONF_DIR}" --restart --reload --debug "$hostname"
+        "$bin"/graceful_stop.sh --config "${HBASE_CONF_DIR}" --restart --reload --debug --maxthreads "${RR_MAXTHREADS}" "$hostname"
         sleep 1
     done
   fi

@@ -624,7 +624,7 @@ public final class ProtobufUtil {
    * @param cellScanner
    * @param proto the protocol buffer Mutate to convert
    * @return the converted client Append
-   * @throws IOException 
+   * @throws IOException
    */
   public static Append toAppend(final MutationProto proto, final CellScanner cellScanner)
   throws IOException {
@@ -1507,9 +1507,9 @@ public final class ProtobufUtil {
    * @throws IOException
    */
   public static void closeRegion(final AdminService.BlockingInterface admin,
-      final byte[] regionName, final boolean transitionInZK) throws IOException {
+      final ServerName server, final byte[] regionName, final boolean transitionInZK) throws IOException {
     CloseRegionRequest closeRegionRequest =
-      RequestConverter.buildCloseRegionRequest(regionName, transitionInZK);
+      RequestConverter.buildCloseRegionRequest(server, regionName, transitionInZK);
     try {
       admin.closeRegion(null, closeRegionRequest);
     } catch (ServiceException se) {
@@ -1528,11 +1528,12 @@ public final class ProtobufUtil {
    * @throws IOException
    */
   public static boolean closeRegion(final AdminService.BlockingInterface admin,
+      final ServerName server,
       final byte[] regionName,
       final int versionOfClosingNode, final ServerName destinationServer,
       final boolean transitionInZK) throws IOException {
     CloseRegionRequest closeRegionRequest =
-      RequestConverter.buildCloseRegionRequest(
+      RequestConverter.buildCloseRegionRequest(server,
         regionName, versionOfClosingNode, destinationServer, transitionInZK);
     try {
       CloseRegionResponse response = admin.closeRegion(null, closeRegionRequest);
@@ -1550,9 +1551,9 @@ public final class ProtobufUtil {
    * @throws IOException
    */
   public static void openRegion(final AdminService.BlockingInterface admin,
-      final HRegionInfo region) throws IOException {
+      ServerName server, final HRegionInfo region) throws IOException {
     OpenRegionRequest request =
-      RequestConverter.buildOpenRegionRequest(region, -1, null);
+      RequestConverter.buildOpenRegionRequest(server, region, -1, null);
     try {
       admin.openRegion(null, request);
     } catch (ServiceException se) {
@@ -2115,6 +2116,34 @@ public final class ProtobufUtil {
       builder.setTableName(ProtobufUtil.toProtoTableName(t));
     }
     builder.setType(AccessControlProtos.Permission.Type.Table);
+    AccessControlProtos.GetUserPermissionsRequest request = builder.build();
+    AccessControlProtos.GetUserPermissionsResponse response =
+      protocol.getUserPermissions(null, request);
+    List<UserPermission> perms = new ArrayList<UserPermission>();
+    for (AccessControlProtos.UserPermission perm: response.getUserPermissionList()) {
+      perms.add(ProtobufUtil.toUserPermission(perm));
+    }
+    return perms;
+  }
+
+  /**
+   * A utility used to get permissions for selected namespace.
+   * <p>
+   * It's also called by the shell, in case you want to find references.
+   *
+   * @param protocol the AccessControlService protocol proxy
+   * @param namespace name of the namespace
+   * @throws ServiceException
+   */
+  public static List<UserPermission> getUserPermissions(
+      AccessControlService.BlockingInterface protocol,
+      byte[] namespace) throws ServiceException {
+    AccessControlProtos.GetUserPermissionsRequest.Builder builder =
+      AccessControlProtos.GetUserPermissionsRequest.newBuilder();
+    if (namespace != null) {
+      builder.setNamespaceName(HBaseZeroCopyByteString.wrap(namespace));
+    }
+    builder.setType(AccessControlProtos.Permission.Type.Namespace);
     AccessControlProtos.GetUserPermissionsRequest request = builder.build();
     AccessControlProtos.GetUserPermissionsResponse response =
       protocol.getUserPermissions(null, request);

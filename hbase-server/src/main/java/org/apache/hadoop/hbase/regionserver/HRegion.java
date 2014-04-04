@@ -130,6 +130,7 @@ import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.hbase.util.CancelableProgressable;
 import org.apache.hadoop.hbase.util.ClassSize;
 import org.apache.hadoop.hbase.util.CompressionTest;
+import org.apache.hadoop.hbase.util.Counter;
 import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
 import org.apache.hadoop.hbase.util.FSUtils;
 import org.apache.hadoop.hbase.util.HashedBytes;
@@ -137,7 +138,6 @@ import org.apache.hadoop.hbase.util.Pair;
 import org.apache.hadoop.hbase.util.Threads;
 import org.apache.hadoop.io.MultipleIOException;
 import org.apache.hadoop.util.StringUtils;
-import org.cliffc.high_scale_lib.Counter;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
@@ -773,8 +773,23 @@ public class HRegion implements HeapSize { // , Writable{
    */
   public static HDFSBlocksDistribution computeHDFSBlocksDistribution(final Configuration conf,
       final HTableDescriptor tableDescriptor, final HRegionInfo regionInfo) throws IOException {
-    HDFSBlocksDistribution hdfsBlocksDistribution = new HDFSBlocksDistribution();
     Path tablePath = FSUtils.getTableDir(FSUtils.getRootDir(conf), tableDescriptor.getTableName());
+    return computeHDFSBlocksDistribution(conf, tableDescriptor, regionInfo, tablePath);
+  }
+
+  /**
+   * This is a helper function to compute HDFS block distribution on demand
+   * @param conf configuration
+   * @param tableDescriptor HTableDescriptor of the table
+   * @param regionInfo encoded name of the region
+   * @param tablePath the table directory
+   * @return The HDFS blocks distribution for the given region.
+   * @throws IOException
+   */
+  public static HDFSBlocksDistribution computeHDFSBlocksDistribution(final Configuration conf,
+      final HTableDescriptor tableDescriptor, final HRegionInfo regionInfo,  Path tablePath)
+      throws IOException {
+    HDFSBlocksDistribution hdfsBlocksDistribution = new HDFSBlocksDistribution();
     FileSystem fs = tablePath.getFileSystem(conf);
 
     HRegionFileSystem regionFs = new HRegionFileSystem(conf, fs, tablePath, regionInfo);
@@ -803,7 +818,7 @@ public class HRegion implements HeapSize { // , Writable{
     if (this.rsAccounting != null) {
       rsAccounting.addAndGetGlobalMemstoreSize(memStoreSize);
     }
-    return this.memstoreSize.getAndAdd(memStoreSize);
+    return this.memstoreSize.addAndGet(memStoreSize);
   }
 
   /** @return a HRegionInfo object for this region */
@@ -976,22 +991,25 @@ public class HRegion implements HeapSize { // , Writable{
     }
 
     status.setStatus("Disabling compacts and flushes for region");
-    boolean wasFlushing = false;
     synchronized (writestate) {
       // Disable compacting and flushing by background threads for this
       // region.
       writestate.writesEnabled = false;
-      wasFlushing = writestate.flushing;
       LOG.debug("Closing " + this + ": disabling compactions & flushes");
       waitForFlushesAndCompactions();
     }
     // If we were not just flushing, is it worth doing a preflush...one
     // that will clear out of the bulk of the memstore before we put up
     // the close flag?
-    if (!abort && !wasFlushing && worthPreFlushing()) {
+    if (!abort && worthPreFlushing()) {
       status.setStatus("Pre-flushing region before close");
       LOG.info("Running close preflush of " + this.getRegionNameAsString());
-      internalFlushcache(status);
+      try {
+        internalFlushcache(status);
+      } catch (IOException ioe) {
+        // Failed to flush the region. Keep going.
+        status.setStatus("Failed pre-flush " + this + "; " + ioe.getMessage());
+      }
     }
 
     this.closing.set(true);
@@ -1007,7 +1025,30 @@ public class HRegion implements HeapSize { // , Writable{
       LOG.debug("Updates disabled for region " + this);
       // Don't flush the cache if we are aborting
       if (!abort) {
-        internalFlushcache(status);
+        int flushCount = 0;
+        while (this.getMemstoreSize().get() > 0) {
+          try {
+            if (flushCount++ > 0) {
+              int actualFlushes = flushCount - 1;
+              if (actualFlushes > 5) {
+                // If we tried 5 times and are unable to clear memory, abort
+                // so we do not lose data
+                throw new DroppedSnapshotException("Failed clearing memory after " +
+                  actualFlushes + " attempts on region: " + Bytes.toStringBinary(getRegionName()));
+              } 
+              LOG.info("Running extra flush, " + actualFlushes +
+                " (carrying snapshot?) " + this);
+            }
+            internalFlushcache(status);
+          } catch (IOException ioe) {
+            status.setStatus("Failed flush " + this + ", putting online again");
+            synchronized (writestate) {
+              writestate.writesEnabled = true;
+            }
+            // Have to throw to upper layers.  I can't abort server from here.
+            throw ioe;
+          }
+        }
       }
 
       Map<byte[], List<StoreFile>> result =
@@ -1021,6 +1062,7 @@ public class HRegion implements HeapSize { // , Writable{
 
         // close each store in parallel
         for (final Store store : stores.values()) {
+          assert abort? true: store.getFlushableSize() == 0;
           completionService
               .submit(new Callable<Pair<byte[], Collection<StoreFile>>>() {
                 @Override
@@ -1050,7 +1092,7 @@ public class HRegion implements HeapSize { // , Writable{
         }
       }
       this.closed.set(true);
-
+      if (memstoreSize.get() != 0) LOG.error("Memstore size is " + memstoreSize.get());
       if (coprocessorHost != null) {
         status.setStatus("Running coprocessor post-close hooks");
         this.coprocessorHost.postClose(abort);
@@ -1536,7 +1578,7 @@ public class HRegion implements HeapSize { // , Writable{
     status.setStatus("Obtaining lock to block concurrent updates");
     // block waiting for the lock for internal flush
     this.updatesLock.writeLock().lock();
-    long flushsize = this.memstoreSize.get();
+    long totalFlushableSize = 0;
     status.setStatus("Preparing to flush by snapshotting stores");
     List<StoreFlushContext> storeFlushCtxs = new ArrayList<StoreFlushContext>(stores.size());
     long flushSeqId = -1L;
@@ -1558,6 +1600,7 @@ public class HRegion implements HeapSize { // , Writable{
       }
 
       for (Store s : stores.values()) {
+        totalFlushableSize += s.getFlushableSize();
         storeFlushCtxs.add(s.createFlushContext(flushSeqId));
       }
 
@@ -1569,7 +1612,7 @@ public class HRegion implements HeapSize { // , Writable{
       this.updatesLock.writeLock().unlock();
     }
     String s = "Finished memstore snapshotting " + this +
-      ", syncing WAL and waiting on mvcc, flushsize=" + flushsize;
+      ", syncing WAL and waiting on mvcc, flushsize=" + totalFlushableSize;
     status.setStatus(s);
     if (LOG.isTraceEnabled()) LOG.trace(s);
 
@@ -1616,7 +1659,7 @@ public class HRegion implements HeapSize { // , Writable{
       storeFlushCtxs.clear();
 
       // Set down the memstore size by amount of flush.
-      this.addAndGetGlobalMemstoreSize(-flushsize);
+      this.addAndGetGlobalMemstoreSize(-totalFlushableSize);
     } catch (Throwable t) {
       // An exception here means that the snapshot was not persisted.
       // The hlog needs to be replayed so its content is restored to memstore.
@@ -1656,7 +1699,7 @@ public class HRegion implements HeapSize { // , Writable{
     long time = EnvironmentEdgeManager.currentTimeMillis() - startTime;
     long memstoresize = this.memstoreSize.get();
     String msg = "Finished memstore flush of ~" +
-      StringUtils.humanReadableInt(flushsize) + "/" + flushsize +
+      StringUtils.humanReadableInt(totalFlushableSize) + "/" + totalFlushableSize +
       ", currentsize=" +
       StringUtils.humanReadableInt(memstoresize) + "/" + memstoresize +
       " for region " + this + " in " + time + "ms, sequenceid=" + flushSeqId +
@@ -1664,7 +1707,7 @@ public class HRegion implements HeapSize { // , Writable{
       ((wal == null)? "; wal=null": "");
     LOG.info(msg);
     status.setStatus(msg);
-    this.recentFlushes.add(new Pair<Long,Long>(time/1000, flushsize));
+    this.recentFlushes.add(new Pair<Long,Long>(time/1000, totalFlushableSize));
 
     return compactionRequested;
   }
@@ -2856,7 +2899,8 @@ public class HRegion implements HeapSize { // , Writable{
       }
 
       try {
-        seqid = replayRecoveredEdits(edits, maxSeqIdInStores, reporter);
+        // replay the edits. Replay can return -1 if everything is skipped, only update if seqId is greater
+        seqid = Math.max(seqid, replayRecoveredEdits(edits, maxSeqIdInStores, reporter));
       } catch (IOException e) {
         boolean skipErrors = conf.getBoolean(
             HConstants.HREGION_EDITS_REPLAY_SKIP_ERRORS,
@@ -2978,6 +3022,7 @@ public class HRegion implements HeapSize { // , Writable{
           if (firstSeqIdInLog == -1) {
             firstSeqIdInLog = key.getLogSeqNum();
           }
+          currentEditSeqId = key.getLogSeqNum();
           boolean flush = false;
           for (KeyValue kv: val.getKeyValues()) {
             // Check this edit is for me. Also, guard against writing the special
@@ -3012,7 +3057,6 @@ public class HRegion implements HeapSize { // , Writable{
               skippedEdits++;
               continue;
             }
-            currentEditSeqId = key.getLogSeqNum();
             // Once we are over the limit, restoreEdit will keep returning true to
             // flush -- but don't flush until we've played all the kvs that make up
             // the WALEdit.
@@ -3408,7 +3452,7 @@ public class HRegion implements HeapSize { // , Writable{
     // KeyValue indicating that limit is reached when scanning
     private final KeyValue KV_LIMIT = new KeyValue();
     private final byte [] stopRow;
-    private final Filter filter;
+    private final FilterWrapper filter;
     private int batch;
     private int isScan;
     private boolean filterClosed = false;
@@ -3695,14 +3739,15 @@ public class HRegion implements HeapSize { // , Writable{
               isStopRow(nextKv.getBuffer(), nextKv.getRowOffset(), nextKv.getRowLength());
           // save that the row was empty before filters applied to it.
           final boolean isEmptyRow = results.isEmpty();
-
+          
           // We have the part of the row necessary for filtering (all of it, usually).
           // First filter with the filterRow(List).
+          FilterWrapper.FilterRowRetCode ret = FilterWrapper.FilterRowRetCode.NOT_CALLED;
           if (filter != null && filter.hasFilterRow()) {
-            filter.filterRowCells(results);
+            ret = filter.filterRowCellsWithRet(results);
           }
           
-          if (isEmptyRow || filterRow()) {
+          if ((isEmptyRow || ret == FilterWrapper.FilterRowRetCode.EXCLUDE) || filterRow()) {
             results.clear();
             boolean moreRows = nextRow(currentRow, offset, length);
             if (!moreRows) return false;
@@ -3969,11 +4014,36 @@ public class HRegion implements HeapSize { // , Writable{
                                       final HLog hlog,
                                       final boolean initialize, final boolean ignoreHLog)
       throws IOException {
+      Path tableDir = FSUtils.getTableDir(rootDir, info.getTable());
+      return createHRegion(info, rootDir, tableDir, conf, hTableDescriptor, hlog, initialize, ignoreHLog);
+  }
+
+  /**
+   * Convenience method creating new HRegions. Used by createTable.
+   * The {@link HLog} for the created region needs to be closed
+   * explicitly, if it is not null.
+   * Use {@link HRegion#getLog()} to get access.
+   *
+   * @param info Info for region to create.
+   * @param rootDir Root directory for HBase instance
+   * @param tableDir table directory
+   * @param conf
+   * @param hTableDescriptor
+   * @param hlog shared HLog
+   * @param initialize - true to initialize the region
+   * @param ignoreHLog - true to skip generate new hlog if it is null, mostly for createTable
+   * @return new HRegion
+   * @throws IOException
+   */
+  public static HRegion createHRegion(final HRegionInfo info, final Path rootDir, final Path tableDir,
+                                      final Configuration conf,
+                                      final HTableDescriptor hTableDescriptor,
+                                      final HLog hlog,
+                                      final boolean initialize, final boolean ignoreHLog)
+      throws IOException {
     LOG.info("creating HRegion " + info.getTable().getNameAsString()
         + " HTD == " + hTableDescriptor + " RootDir = " + rootDir +
         " Table name == " + info.getTable().getNameAsString());
-
-    Path tableDir = FSUtils.getTableDir(rootDir, info.getTable());
     FileSystem fs = FileSystem.get(conf);
     HRegionFileSystem rfs = HRegionFileSystem.createRegionOnFileSystem(conf, fs, tableDir, info);
     HLog effectiveHLog = hlog;
@@ -4129,14 +4199,38 @@ public class HRegion implements HeapSize { // , Writable{
       final Path rootDir, final HRegionInfo info, final HTableDescriptor htd, final HLog wal,
       final RegionServerServices rsServices, final CancelableProgressable reporter)
       throws IOException {
+    Path tableDir = FSUtils.getTableDir(rootDir, info.getTable());
+    return openHRegion(conf, fs, rootDir, tableDir, info, htd, wal, rsServices, reporter);
+  }
+
+  /**
+   * Open a Region.
+   * @param conf The Configuration object to use.
+   * @param fs Filesystem to use
+   * @param rootDir Root directory for HBase instance
+   * @param info Info for region to be opened.
+   * @param htd the table descriptor
+   * @param wal HLog for region to use. This method will call
+   * HLog#setSequenceNumber(long) passing the result of the call to
+   * HRegion#getMinSequenceId() to ensure the log id is properly kept
+   * up.  HRegionStore does this every time it opens a new region.
+   * @param rsServices An interface we can request flushes against.
+   * @param reporter An interface we can report progress against.
+   * @return new HRegion
+   * @throws IOException
+   */
+  public static HRegion openHRegion(final Configuration conf, final FileSystem fs,
+      final Path rootDir, final Path tableDir, final HRegionInfo info, final HTableDescriptor htd, final HLog wal,
+      final RegionServerServices rsServices, final CancelableProgressable reporter)
+      throws IOException {
     if (info == null) throw new NullPointerException("Passed region info is null");
     if (LOG.isDebugEnabled()) {
       LOG.debug("Opening region: " + info);
     }
-    Path dir = FSUtils.getTableDir(rootDir, info.getTable());
-    HRegion r = HRegion.newHRegion(dir, wal, fs, conf, info, htd, rsServices);
+    HRegion r = HRegion.newHRegion(tableDir, wal, fs, conf, info, htd, rsServices);
     return r.openHRegion(reporter);
   }
+
 
   /**
    * Useful when reopening a closed region (normally for unit tests)
@@ -5037,9 +5131,9 @@ public class HRegion implements HeapSize { // , Writable{
 
   // woefully out of date - currently missing:
   // 1 x HashMap - coprocessorServiceHandlers
-  // 6 org.cliffc.high_scale_lib.Counter - numMutationsWithoutWAL, dataInMemoryWithoutWAL,
+  // 6 x Counter - numMutationsWithoutWAL, dataInMemoryWithoutWAL,
   //   checkAndMutateChecksPassed, checkAndMutateChecksFailed, readRequestsCount,
-  //   writeRequestsCount, updatesBlockedMs
+  //   writeRequestsCount
   // 1 x HRegion$WriteState - writestate
   // 1 x RegionCoprocessorHost - coprocessorHost
   // 1 x RegionSplitPolicy - splitPolicy

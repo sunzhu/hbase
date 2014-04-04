@@ -684,7 +684,7 @@ public class StoreFile {
   public Long getMinimumTimestamp() {
     return (getReader().timeRangeTracker == null) ?
         null :
-        getReader().timeRangeTracker.minimumTimestamp;
+        getReader().timeRangeTracker.getMinimumTimestamp();
   }
 
   /**
@@ -1358,6 +1358,28 @@ public class StoreFile {
       return true;
     }
 
+    /**
+     * Checks whether the given scan rowkey range overlaps with the current storefile's
+     * @param scan the scan specification. Used to determine the rowkey range.
+     * @return true if there is overlap, false otherwise
+     */
+    public boolean passesKeyRangeFilter(Scan scan) {
+      if (this.getFirstKey() == null || this.getLastKey() == null) {
+        // the file is empty
+        return false;
+      }
+      if (Bytes.equals(scan.getStartRow(), HConstants.EMPTY_START_ROW)
+          && Bytes.equals(scan.getStopRow(), HConstants.EMPTY_END_ROW)) {
+        return true;
+      }
+      KeyValue startKeyValue = KeyValue.createFirstOnRow(scan.getStartRow());
+      KeyValue stopKeyValue = KeyValue.createLastOnRow(scan.getStopRow());
+      boolean nonOverLapping = (getComparator().compareFlatKey(this.getFirstKey(),
+        stopKeyValue.getKey()) > 0 && !Bytes.equals(scan.getStopRow(), HConstants.EMPTY_END_ROW))
+          || getComparator().compareFlatKey(this.getLastKey(), startKeyValue.getKey()) < 0;
+      return !nonOverLapping;
+    }
+
     public Map<byte[], byte[]> loadFileInfo() throws IOException {
       Map<byte [], byte []> fi = reader.loadFileInfo();
 
@@ -1533,7 +1555,7 @@ public class StoreFile {
     }
 
     public long getMaxTimestamp() {
-      return timeRangeTracker == null ? Long.MAX_VALUE : timeRangeTracker.maximumTimestamp;
+      return timeRangeTracker == null ? Long.MAX_VALUE : timeRangeTracker.getMaximumTimestamp();
     }
   }
 

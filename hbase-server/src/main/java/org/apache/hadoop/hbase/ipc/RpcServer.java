@@ -96,6 +96,7 @@ import org.apache.hadoop.hbase.security.SaslUtil;
 import org.apache.hadoop.hbase.security.UserProvider;
 import org.apache.hadoop.hbase.security.token.AuthenticationTokenSecretManager;
 import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.hadoop.hbase.util.Counter;
 import org.apache.hadoop.hbase.util.Pair;
 import org.apache.hadoop.io.BytesWritable;
 import org.apache.hadoop.io.IntWritable;
@@ -114,7 +115,6 @@ import org.apache.hadoop.security.token.SecretManager;
 import org.apache.hadoop.security.token.SecretManager.InvalidToken;
 import org.apache.hadoop.security.token.TokenIdentifier;
 import org.apache.hadoop.util.StringUtils;
-import org.cliffc.high_scale_lib.Counter;
 import org.cloudera.htrace.Trace;
 import org.cloudera.htrace.TraceInfo;
 import org.cloudera.htrace.TraceScope;
@@ -1720,6 +1720,10 @@ public class RpcServer implements RpcServerInterface {
         String msg = "Unable to read call parameter from client " + getHostAddress();
         LOG.warn(msg, t);
 
+        // probably the hbase hadoop version does not match the running hadoop version
+        if (t instanceof LinkageError) {
+          t = new DoNotRetryIOException(t);
+        }
         // If the method is not present on the server, do not retry.
         if (t instanceof UnsupportedOperationException) {
           t = new DoNotRetryIOException(t);
@@ -2214,6 +2218,7 @@ public class RpcServer implements RpcServerInterface {
       // putting it on the wire.  Its needed to adhere to the pb Service Interface but we don't
       // need to pass it over the wire.
       if (e instanceof ServiceException) e = e.getCause();
+      if (e instanceof LinkageError) throw new DoNotRetryIOException(e);
       if (e instanceof IOException) throw (IOException)e;
       LOG.error("Unexpected throwable object ", e);
       throw new IOException(e.getMessage(), e);
